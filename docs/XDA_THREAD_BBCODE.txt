@@ -1,0 +1,304 @@
+[CENTER][SIZE=6][B]LinDeX v3.0.4[/B][/SIZE]
+
+[B]Native Debian Wayland desktop with Vulkan acceleration over physical USB-C DisplayPort[/B]
+
+Maintained by [B]JHoon[/B][/CENTER]
+
+[HEADING=1]Introduction[/HEADING]
+
+LinDeX runs a Debian 13 Trixie ARM64 Wayland desktop directly on the physical USB-C DisplayPort output of a rooted Qualcomm Android device.
+
+Android keeps ownership of the phone display while Debian applications and the Wayland compositor submit rendering work to the physical Adreno GPU through Mesa Turnip or Freedreno/KGSL.
+
+This is not a streamed Android desktop, VNC session, virtual framebuffer, or CPU-copied display.
+
+The current reference device is a Samsung SM-S937N with Qualcomm Adreno 830 and KernelSU.
+
+[CENTER][B][Screenshot 1: Archcraft Sway desktop — replace this line with the uploaded XDA attachment][/B]
+
+[B][Screenshot 2: LinDeX English KernelSU WebUI — replace this line with the uploaded XDA attachment][/B][/CENTER]
+
+[HEADING=1]Downloads and source[/HEADING]
+
+[LIST]
+[*][B]Stable release ZIP:[/B]
+https://github.com/JHoon-KR/LinDeX/releases/download/v3.0.4/LinDeX-v3.0.4.zip
+
+[*][B]Development release ZIP:[/B]
+https://github.com/JHoon-KR/LinDeX/releases/download/v3.0.4-dev/LinDeX-v3.0.4-dev.zip
+
+[*][B]All releases:[/B]
+https://github.com/JHoon-KR/LinDeX/releases
+
+[*][B]Source code and documentation:[/B]
+https://github.com/JHoon-KR/LinDeX
+
+[*][B]Issue tracker:[/B]
+https://github.com/JHoon-KR/LinDeX/issues
+[/LIST]
+
+[B]Stable ZIP SHA-256[/B]
+
+[CODE]9712f74d4938ef3c1f0a1dc5ead90c6e52a2846d29d8fbe803fa3cb831bdbbe5  LinDeX-v3.0.4.zip[/CODE]
+
+[B]Development ZIP SHA-256[/B]
+
+[CODE]3231fcdc6872a9092351a1c57b8aeb94d7403c5c5ed053055632b78da34d9c41  LinDeX-v3.0.4-dev.zip[/CODE]
+
+[HEADING=1]Main features[/HEADING]
+
+[LIST]
+[*]Debian 13 Trixie ARM64 chroot
+[*]Native Mesa Turnip Vulkan rendering through Qualcomm KGSL
+[*]Hardware Freedreno/KGSL OpenGL ES fallback when Vulkan is unavailable
+[*]Physical USB-C DisplayPort output using a bounded DRM lease
+[*]No wlroots, Sway, labwc, Mesa, kernel, or Android system-partition patch required for the display path
+[*]UBWC/XB24 preference for eligible fullscreen direct scanout
+[*]Safe XR24 LINEAR composition fallback for panels, popups, cursors, and overlapping windows
+[*]Automatic EDID mode discovery
+[*]Experimental manual 100, 120, and 144 Hz output modes
+[*]KernelSU WebUI for installation, profiles, display modes, start/stop, and recovery
+[*]Automatic profile dependency, Mesa, and appearance setup
+[*]Session-scoped USB keyboard, mouse, and touchpad routing
+[*]Clean process-group and DRM lease ownership
+[*]Cleanup after stop, compositor failure, or physical cable removal
+[*]No files or overlays installed under Android [ICODE]/system[/ICODE], [ICODE]/vendor[/ICODE], or [ICODE]/product[/ICODE]
+[*]Separate stable and development packages
+[*]No persistent setup, session, or codec logs in stable builds
+[/LIST]
+
+[HEADING=1]Available desktop profiles[/HEADING]
+
+LinDeX v3 currently provides three profiles:
+
+[LIST]
+[*][B]Archcraft Sway Free[/B] — official public Archcraft Sway dotfiles and wallpapers with checksum-locked GPL-3.0 Dark, Light, icon, and cursor assets
+[*][B]LXQt + stock labwc[/B]
+[*][B]XFCE + stock labwc[/B]
+[/LIST]
+
+The Archcraft Sway profile includes three appearance modes:
+
+[LIST]
+[*][B]Official Dark[/B]
+[*][B]Official Light[/B]
+[*][B]Auto-generated · Pywal[/B]
+[/LIST]
+
+Pywal derives a color scheme from the selected wallpaper. It changes generated colors but does not generate a new wallpaper.
+
+Wayfire, River, Hyprland, and Newm are not included because matching official public Archcraft profile sources are not currently packaged and verified by LinDeX.
+
+[HEADING=1]How native GPU acceleration works[/HEADING]
+
+[CODE]
+Debian Wayland application
+|-- Vulkan -> Mesa Turnip --------------------|
+`-- OpenGL/GLES -> Freedreno KGSL ------------|-> /dev/kgsl-3d0
+                                                  -> dma-buf + native fence
+                                                  -> stock Sway or labwc
+
+Android display owner
+-> bounded DRM lease
+-> /dev/dri/card0
+-> MSM/SDE external DP connector, CRTC and plane
+[/CODE]
+
+[ICODE]/dev/kgsl-3d0[/ICODE] is Qualcomm Android's physical Adreno command-submission interface. Turnip uses it for Vulkan, while Freedreno/Gallium uses it for OpenGL and GLES.
+
+[ICODE]/dev/dri/card0[/ICODE] is used for the bounded MSM/SDE display lease. LinDeX leases only the external connector, CRTC, and plane required by the Debian compositor.
+
+The release uses unmodified Debian compositor packages. LinDeX supplies a process-scoped bridge and fail-closed Vulkan device-identity layer instead of replacing wlroots, Sway, labwc, Mesa, the kernel, or Android read-only partitions.
+
+[HEADING=1]UBWC and direct scanout[/HEADING]
+
+New installations use [B]UBWC preference[/B] by default.
+
+[LIST]
+[*]An eligible opaque fullscreen client can use XB24/QCOM UBWC direct scanout when its buffer matches the leased plane.
+[*]A visible panel, Waybar, notification, popup, overlapping window, transformed surface, color operation, or software cursor normally requires composition.
+[*]Composited scenes safely use XR24 LINEAR when required.
+[*]LinDeX does not bypass the compositor's overlap, transform, cursor, color, or synchronization checks.
+[/LIST]
+
+Therefore, seeing XR24 LINEAR while Waybar or another desktop surface is visible is expected behavior and does not mean that Vulkan acceleration has failed.
+
+The WebUI provides these policies:
+
+[LIST]
+[*][B]UBWC preference[/B] — prefers the validated XB24/QCOM candidate while retaining LINEAR fallback
+[*][B]Auto[/B] — exposes the validated candidate without changing the stock compositor preference
+[*][B]LINEAR[/B] — disables modifier use for maximum compatibility
+[/LIST]
+
+[HEADING=1]Reference performance[/HEADING]
+
+These results were collected from one Galaxy S25 Edge with Adreno 830 and are not performance guarantees for other devices.
+
+[LIST]
+[*]Fullscreen 1920×1080 Mailbox vkmark: approximately 12,660 with Turnip Vulkan
+[*]Preceding GLES2 path: approximately 4,078
+[*]Bounded fullscreen vertex workload: approximately 19,927–20,726 FPS with a 1.2 GHz GPU ceiling
+[*]The same workload dropped to approximately 11,824 FPS under a 607 MHz thermal ceiling
+[*]A full-suite reference run scored 11,013 with 88.8% average and 99% peak sampled GPU load
+[*]Strict fullscreen UBWC preference produced 88 of 91 XB24/QCOM active-framebuffer samples; the remaining three were entry and exit transitions
+[/LIST]
+
+vkmark score and individual scene FPS are different measurements. Present mode, resolution, Waybar visibility, GPU clock, battery state, and Android thermal policy must match before results are compared.
+
+LinDeX does not force GPU clocks or disable Android thermal protection.
+
+[HEADING=1]Experimental hardware video acceleration[/HEADING]
+
+LinDeX includes an experimental Android hardware-codec bridge exposed to Debian through VA-API.
+
+Reference-device validation includes:
+
+[LIST]
+[*]H.264 Constrained Baseline hardware encode: 120/120 frames at approximately 84.9 FPS
+[*]HEVC Main hardware encode: 120/120 frames at approximately 81.1 FPS
+[*]H.264 Main+B QCOM PRIME decode: 180/180 frames
+[*]HEVC Main+B QCOM PRIME decode: 120/120 frames
+[*]VP9 Profile 0 QCOM PRIME decode: 120/120 frames
+[*]Explicit modifier 0 LINEAR output using one Vulkan repack and zero CPU raw-pixel copies
+[*]Firefox RDD sandbox path validated with the Android [ICODE]c2.qti.avc.decoder[/ICODE]
+[/LIST]
+
+H.264 High, HEVC Main10, and AV1 remain hidden because they have not passed the same bounded release gate.
+
+Firefox, GStreamer, FFmpeg, OBS, and other applications may use different upload, presentation, and sandbox paths. Hardware-codec support should therefore still be treated as experimental application compatibility rather than a universal zero-copy guarantee.
+
+[HEADING=1]Requirements[/HEADING]
+
+[LIST]
+[*]ARM64 Android device
+[*]KernelSU with module WebUI support
+[*]Qualcomm Adreno exposed through [ICODE]/dev/kgsl-3d0[/ICODE]
+[*]MSM/SDE KMS exposed through [ICODE]/dev/dri/card0[/ICODE]
+[*]USB-C DisplayPort Alt Mode
+[*]Monitor with valid EDID information
+[*]Sufficient storage for the Debian rootfs, packages, Mesa, profiles, and user files
+[*]A backup of any existing [ICODE]/data/local/debian[/ICODE] data
+[/LIST]
+
+Other Qualcomm devices may work, but they must pass their own Vulkan, DRM lease, modifier, display, and hotplug validation.
+
+[HEADING=1]Installation[/HEADING]
+
+[LIST=1]
+[*]Back up everything you need from an existing [ICODE]/data/local/debian[/ICODE] chroot.
+[*]Stop any running LinDeX session.
+[*]Physically disconnect the DisplayPort cable or USB-C display adapter.
+[*]Download either the stable or development LinDeX ZIP.
+[*]Install the ZIP using the KernelSU module installer.
+[*]Check the installer result and stop if a required archive or device check fails.
+[*]Perform a normal Android reboot.
+[*]Open the LinDeX KernelSU WebUI.
+[*]Select Archcraft Sway Free, LXQt + stock labwc, or XFCE + stock labwc.
+[*]If Sway is selected, choose Official Dark, Official Light, or Auto-generated · Pywal.
+[*]Press [B]Start now[/B].
+[*]Connect DisplayPort when requested, or enable automatic DP start after profile setup completes.
+[/LIST]
+
+The first start may install signed Debian packages, the pinned KGSL Mesa payload, and the selected profile assets.
+
+Installation and setup do not create an Android [ICODE]/system[/ICODE] overlay.
+
+[HEADING=1]Stable and development builds[/HEADING]
+
+[LIST]
+[*][B]Stable[/B] keeps required WebUI state but creates no persistent setup, session, or codec diagnostic logs.
+[*][B]Development[/B] retains bounded and rotated diagnostics for reproducing failures.
+[/LIST]
+
+Use the stable build for ordinary use. Use the development build when reporting a reproducible problem.
+
+[HEADING=1]Safety and removal[/HEADING]
+
+[LIST]
+[*]Always detach DisplayPort before installing or updating LinDeX.
+[*]Use a normal Android reboot after installing or updating.
+[*]Never remount or modify Android [ICODE]/system[/ICODE], [ICODE]/vendor[/ICODE], or [ICODE]/product[/ICODE] for LinDeX.
+[*]Back up the Debian chroot before updating or uninstalling.
+[*]Removing the LinDeX module intentionally removes the LinDeX-managed [ICODE]/data/local/debian[/ICODE] chroot and its contents.
+[*]Manual 100, 120, and 144 Hz modes are experimental and do not have automatic rollback.
+[*]If the external display becomes stuck, physically disconnect DP, use WebUI [B]Stop[/B], wait for the session to report stopped, and reconnect only after valid EDID information appears.
+[/LIST]
+
+Scoped emergency stop command:
+
+[CODE]su -c 'debian-gpu-control stop'[/CODE]
+
+Do not use broad process-name kills or commands that disable every Android display.
+
+[HEADING=1]Current limitations[/HEADING]
+
+[LIST]
+[*]The primary reference target is currently the Samsung SM-S937N with Adreno 830.
+[*]Additional Qualcomm devices and OpenGL-only fallback devices still require device-specific validation.
+[*]Direct scanout is possible only when the compositor scene is eligible.
+[*]A visible Waybar or overlapping desktop surface normally causes safe LINEAR composition.
+[*]Manual high-refresh modes remain dependent on the phone, USB-C adapter, cable, and monitor.
+[*]Codec advertisement is fail-closed and application compatibility remains experimental.
+[*]GNOME, KDE Plasma, KWin, Wayfire, River, Hyprland, and Newm are not current LinDeX release profiles.
+[*]USB dock input ownership and long-duration suspend/hotplug behavior still need validation on more hardware.
+[/LIST]
+
+LinDeX should not be described as universally “100% accelerated.” The reference Vulkan, dma-buf, UBWC-preference, and ordinary fullscreen direct-scanout paths are implemented and verified, but portability and application compatibility depend on the device.
+
+[HEADING=1]Credits[/HEADING]
+
+LinDeX is maintained by [B]JHoon[/B].
+
+The project began from:
+
+[LIST]
+[*]DOAN by av2xn: https://github.com/av2xn/DOAN
+[*]Magisk-Debian-Chroot by av2xn: https://github.com/av2xn/Magisk-Debian-Chroot
+[/LIST]
+
+Additional upstream projects include:
+
+[LIST]
+[*]Mesa for Android container: https://github.com/lfdevs/mesa-for-android-container
+[*]Debian
+[*]Mesa, Turnip, Freedreno, wlroots, Sway, labwc, LXQt, XFCE, libdrm, libseat, Wayland, and Vulkan
+[*]Official Archcraft Sway public repository: https://github.com/archcraft-os/archcraft-sway
+[/LIST]
+
+Thank you to the Archcraft Sway creator for the public GPL-3.0 profile and appearance work.
+
+Optional Archcraft support link:
+
+https://ko-fi.com/s/10f2e87af3
+
+The Ko-fi page is not an installation source, payment requirement, or license condition.
+
+[HEADING=1]License[/HEADING]
+
+LinDeX code is released under the MIT License.
+
+Bundled and downloaded third-party components retain their original upstream licenses. The public Archcraft Sway dotfiles and appearance assets remain GPL-3.0.
+
+Complete notices and source locks are available in the GitHub repository.
+
+[HEADING=1]Bug reports[/HEADING]
+
+Please use the GitHub issue tracker:
+
+https://github.com/JHoon-KR/LinDeX/issues
+
+When reporting a problem, include:
+
+[LIST]
+[*]Device model and SoC/GPU
+[*]Android version and KernelSU version
+[*]Selected LinDeX profile
+[*]Stable or development build
+[*]Monitor, cable, and USB-C adapter
+[*]Selected output mode and modifier policy
+[*]Whether Vulkan or OpenGL ES was selected
+[*]A small relevant excerpt from the development log
+[/LIST]
+
+Do not publish device serial numbers, authentication tokens, cookies, full Android logs, or unrelated process information.
