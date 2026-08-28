@@ -61,6 +61,8 @@ Thumbs.db
 !/tests/bridge/
 /tests/bridge/*
 !/tests/bridge/vulkan_drm_identity_test.c
+!/tests/bridge/vulkan_drm_identity_layer_ack_test.c
+!/tests/bridge/vulkan_drm_identity_layer_lifecycle_test.c
 
 # Old v2/device-specific scripts. Current v3 scripts remain visible.
 /scripts/*kwin*
