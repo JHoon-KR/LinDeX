@@ -1,0 +1,421 @@
+#!/bin/sh
+# Generic inner session for LinDeX free/open-source compositor profiles.
+set -eu
+umask 077
+
+BRIDGE_ROOT=/opt/android-drm-lease-kit/bridge/stock-profile-bridge-v12
+PROFILE=
+[ "${1:-}" = --profile ] && [ "$#" -eq 2 ] && PROFILE=$2 || {
+    echo 'usage: stock-profile-session --profile PROFILE' >&2
+    exit 2
+}
+case "$PROFILE" in
+    lxqt|xfce|sway) ;;
+    *) echo 'invalid profile' >&2; exit 2 ;;
+esac
+
+# Ignore obsolete caller-supplied promotion acknowledgements. Public beta
+# decode profiles are derived only from this session's live hardware preflight.
+unset ANDROID_DRM_CODEC_HEVC_APP_GATE ANDROID_DRM_CODEC_VP9_APP_GATE
+case "${DRM_LEASE_FD:-}" in ''|*[!0-9]*) echo 'invalid lease fd' >&2; exit 78 ;; esac
+[ "$DRM_LEASE_FD" -ge 3 ] || exit 78
+case "${DRM_LEASE_OBJECTS:-}" in ''|*[!0-9,]*) echo 'invalid lease objects' >&2; exit 78 ;; esac
+old_ifs=$IFS
+IFS=,
+set -- $DRM_LEASE_OBJECTS
+IFS=$old_ifs
+[ "$#" -eq 3 ] || { echo 'lease must contain connector, CRTC, primary plane' >&2; exit 78; }
+
+for required in \
+    "$BRIDGE_ROOT/lib/libandroid-drm-bridge.so.1" \
+    "$BRIDGE_ROOT/lib/libandroid-drm-preload.so" \
+    "$BRIDGE_ROOT/lib/libandroid-vulkan-drm-identity.so" \
+    "$BRIDGE_ROOT/lib/libandroid-vulkan-drm-identity-layer.so" \
+    "$BRIDGE_ROOT/share/vulkan/explicit_layer.d/VK_LAYER_LINDEX_android_drm_identity.json" \
+    "$BRIDGE_ROOT/lib/libdrm_lease_seat.so" \
+    "$BRIDGE_ROOT/bin/android-drm-bridge-probe"; do
+    [ -f "$required" ] && [ ! -L "$required" ] || {
+        echo "missing bridge component: $required" >&2
+        exit 78
+    }
+done
+(cd "$BRIDGE_ROOT" && sha256sum -c BRIDGE_RUNTIME.sha256 >/dev/null 2>&1) || {
+    echo 'bridge runtime verification failed' >&2
+    exit 78
+}
+
+export XDG_RUNTIME_DIR=/run/user/0
+export HOME=/root
+export LANG=C.UTF-8
+export PATH="$BRIDGE_ROOT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export LD_LIBRARY_PATH=$BRIDGE_ROOT/lib
+export LIBSEAT_BACKEND=builtin
+export SEATD_VTBOUND=0
+export DRM_LEASE_DEVICE=/dev/dri/card0
+export WLR_DRM_DEVICES=/dev/dri/card0
+export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+export WLR_BACKENDS=drm,libinput
+export WLR_RENDERER_ALLOW_SOFTWARE=0
+export FD_KGSL_ENABLE_DMABUF=1
+export GDK_BACKEND=wayland
+export QT_QPA_PLATFORM=wayland
+export XDG_SESSION_TYPE=wayland
+unset DISPLAY WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE LIBGL_ALWAYS_INDIRECT
+unset GALLIUM_DRIVER VK_ICD_FILENAMES VK_DRIVER_FILES DRI_PRIME
+unset VK_LAYER_PATH VK_INSTANCE_LAYERS
+unset WLR_DRM_NO_MODIFIERS WLR_EGL_NO_MODIFIERS WLR_SCENE_DISABLE_DIRECT_SCANOUT
+unset ANDROID_DRM_PRELOAD_ENABLE ANDROID_DRM_PRELOAD_CANDIDATE_ACK
+unset ANDROID_DRM_PRELOAD_PRIMARY_PLANE ANDROID_DRM_PRELOAD_IN_FORMATS_BLOB
+unset ANDROID_DRM_PRELOAD_POLICY ANDROID_DRM_PRELOAD_STRICT_ACK
+unset ANDROID_VULKAN_DRM_IDENTITY_ENABLE ANDROID_VULKAN_DRM_IDENTITY_ACK
+unset ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID
+unset LIBVA_DRIVER_NAME LIBVA_DRIVERS_PATH ADVC_VAAPI_SOCKET
+unset GST_VAAPI_DRM_DEVICE GST_VAAPI_ALL_DRIVERS GST_REGISTRY_FORK GST_REGISTRY
+unset ADVC_VAAPI_ENABLE_AVC ADVC_VAAPI_ENABLE_ENCODE ADVC_VAAPI_QCOM_IMPORT
+unset ADVC_VAAPI_ENABLE_HEVC ADVC_VAAPI_ENABLE_VP9
+unset ADVC_VAAPI_GPU_LINEAR_REPACK ADVC_VAAPI_DECODE_OUTPUT
+unset ADVC_VAAPI_ENCODE_INPUT ADVC_VAAPI_OUTPUT
+unset ADVC_VAAPI_ASYNC_EXPORT
+unset ADVC_REPACK_GATEWAY_OUTPUT ADVC_REPACK_GATEWAY_QCOM_PASSTHROUGH
+unset ADVC_VAAPI_ENABLE_WRITE_EXPORT ADVC_VAAPI_ENABLE_GENERIC_UPLOAD
+unset ADVC_VAAPI_ENABLE_PRIVATE_DECODE_EOS
+unset ADVC_VAAPI_H264_INBAND_CONFIG_UPDATE
+unset ADVC_VAAPI_H264_REORDER_BOUND
+unset ADVC_CODEC_DECODER_DESTROY_DRAIN
+unset ADVC_VAAPI_ALLOW_CPU_COPY ADVC_VAAPI_TRACE
+unset ADVC_REPACK_GATEWAY_ENABLE ADVC_REPACK_GATEWAY_TRACE
+unset LINDEX_FIREFOX_RDD_SOCKET_ENABLE LINDEX_FIREFOX_RDD_SOCKET_ACK
+unset LINDEX_FIREFOX_RDD_SOCKET_DEBUG
+unset LINDEX_FIREFOX_PRELOAD
+unset LINDEX_EGL_DRM_IDENTITY_ENABLE LINDEX_EGL_DRM_IDENTITY_ACK
+unset LINDEX_EGL_DRM_IDENTITY_DEBUG
+
+exact_rdev_pair() {
+    node=$1
+    [ -c "$node" ] || return 1
+    rdev=$(stat -c '%t:%T' "$node" 2>/dev/null) || return 1
+    case "$rdev" in *:*) ;; *) return 1 ;; esac
+    major_hex=${rdev%%:*}
+    minor_hex=${rdev#*:}
+    [ -n "$major_hex" ] && [ -n "$minor_hex" ] || return 1
+    case "$major_hex$minor_hex" in *[!0-9a-fA-F]*) return 1 ;; esac
+    major_dec=$((0x$major_hex))
+    minor_dec=$((0x$minor_hex))
+    printf '%u-%u\n' "$major_dec" "$minor_dec"
+}
+
+# Export ADVC only when the outer launcher has completed the fail-closed
+# broker handshake and the guest can independently verify every dependency.
+# Missing files, mounts or socket disable codec advertisement without blocking
+# the desktop itself; applications then retain their normal software fallback.
+ADVC_CODEC_ROOT=/opt/android-drm-lease-kit/codec
+ADVC_VAAPI_DRIVER_DIR=$ADVC_CODEC_ROOT
+ADVC_VAAPI_DRIVER=$ADVC_VAAPI_DRIVER_DIR/advc_drv_video.so
+ADVC_VAAPI_MANIFEST=$ADVC_VAAPI_DRIVER_DIR/SHA256SUMS
+ADVC_VAAPI_UPSTREAM_SOCKET=/run/android-drm/advc-broker-1.1.sock
+ADVC_VAAPI_SOCKET_PATH=/run/android-drm/advc-repack-gateway-$$.sock
+ADVC_REPACK_GATEWAY=$ADVC_CODEC_ROOT/advc-repack-gateway
+ADVC_DECODE_PREFLIGHT=$ADVC_CODEC_ROOT/advc-vaapi-decode-preflight
+ADVC_FIREFOX_RDD_SOCKET=$ADVC_CODEC_ROOT/liblindex-firefox-advc-rdd-socket.so
+ADVC_FIREFOX_EGL_IDENTITY=$ADVC_CODEC_ROOT/liblindex-firefox-egl-drm-identity.so
+ADVC_CODEC_CANDIDATE=0
+case "${ANDROID_DRM_VIDEO_ACCELERATION:-disabled}" in
+    auto)
+        if [ -c /dev/dri/renderD128 ] &&
+           [ -e /proc/self/fd ] &&
+           [ -d /sys/class/drm/renderD128 ] &&
+           [ -S "$ADVC_VAAPI_UPSTREAM_SOCKET" ] &&
+           [ -f "$ADVC_VAAPI_DRIVER" ] && [ ! -L "$ADVC_VAAPI_DRIVER" ] &&
+           [ -x "$ADVC_REPACK_GATEWAY" ] && [ ! -L "$ADVC_REPACK_GATEWAY" ] &&
+           [ -x "$ADVC_DECODE_PREFLIGHT" ] && [ ! -L "$ADVC_DECODE_PREFLIGHT" ] &&
+           [ -f "$ADVC_FIREFOX_RDD_SOCKET" ] && [ ! -L "$ADVC_FIREFOX_RDD_SOCKET" ] &&
+           [ -f "$ADVC_FIREFOX_EGL_IDENTITY" ] && [ ! -L "$ADVC_FIREFOX_EGL_IDENTITY" ] &&
+           [ -f "$ADVC_VAAPI_MANIFEST" ] && [ ! -L "$ADVC_VAAPI_MANIFEST" ] &&
+           (cd "$ADVC_VAAPI_DRIVER_DIR" &&
+               sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+            ADVC_CODEC_CANDIDATE=1
+        else
+            echo 'video-acceleration=disabled reason=advc-runtime-incomplete' >&2
+        fi
+        ;;
+    disabled) ;;
+    *) echo 'video-acceleration=disabled reason=invalid-policy' >&2 ;;
+esac
+
+# Keep upstream wlroots in charge of scene eligibility. The bridge only makes
+# the exact, lease-validated QCOM candidate visible; it never forces a client
+# buffer onto the primary plane or overrides overlap/transform/color checks.
+case "${ANDROID_DRM_DIRECT_SCANOUT:-auto}" in
+    auto) ;;
+    off) export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 ;;
+    *) echo 'invalid direct scanout policy' >&2; exit 78 ;;
+esac
+
+case "${ANDROID_DRM_OUTPUT_MODIFIER_POLICY:-ubwc}" in
+    linear)
+        export WLR_DRM_NO_MODIFIERS=1
+        export WLR_EGL_NO_MODIFIERS=1
+        ;;
+    auto|ubwc)
+        export ANDROID_DRM_PRELOAD_ENABLE=1
+        export ANDROID_DRM_PRELOAD_CANDIDATE_ACK=exact-device-candidate-only
+        export ANDROID_DRM_PRELOAD_PRIMARY_PLANE=$3
+        export ANDROID_DRM_PRELOAD_IN_FORMATS_BLOB=auto
+        if [ "${ANDROID_DRM_OUTPUT_MODIFIER_POLICY:-ubwc}" = ubwc ]; then
+            export ANDROID_DRM_PRELOAD_POLICY=strict-xb24-qcom-linear
+            export ANDROID_DRM_PRELOAD_STRICT_ACK=exact-device-strict-xb24-qcom-linear-fallback
+        else
+            export ANDROID_DRM_PRELOAD_POLICY=append
+        fi
+        ;;
+    *) echo 'invalid output modifier policy' >&2; exit 78 ;;
+esac
+
+# Prefer a real hardware Vulkan renderer when the installed Mesa exposes one.
+# Some Android devices expose only the GLES KGSL path, so failed or software
+# Vulkan probing falls back to hardware GLES2 without aborting the session.
+vk_icd=
+vk_probe=
+renderer_policy=${ANDROID_DRM_RENDERER_POLICY:-auto}
+case "$renderer_policy" in auto|vulkan|gles2) ;; *) echo 'invalid renderer policy' >&2; exit 78 ;; esac
+if [ "$renderer_policy" != gles2 ] && command -v vulkaninfo >/dev/null 2>&1; then
+    for candidate in /usr/share/vulkan/icd.d/*freedreno*.json \
+        /usr/share/vulkan/icd.d/*turnip*.json; do
+        [ -f "$candidate" ] || continue
+        if vk_probe=$(VK_DRIVER_FILES="$candidate" \
+            MESA_LOADER_DRIVER_OVERRIDE=kgsl vulkaninfo --summary 2>&1) &&
+            ! printf '%s\n' "$vk_probe" | grep -Eiq \
+                'llvmpipe|lavapipe|swiftshader|software rasterizer'; then
+            vk_icd=$candidate
+            break
+        fi
+    done
+fi
+if [ -n "$vk_icd" ]; then
+    if primary_rdev=$(exact_rdev_pair /dev/dri/card0) &&
+       render_rdev=$(exact_rdev_pair /dev/dri/renderD128) &&
+       kgsl_rdev=$(exact_rdev_pair /dev/kgsl-3d0); then
+        vk_identity_ack=turnip-qualcomm-card0-renderD128-kgsl3d0-${primary_rdev}-${render_rdev}-${kgsl_rdev}-v2
+    else
+        vk_identity_ack=
+    fi
+fi
+if [ -n "$vk_icd" ] && [ -n "$vk_identity_ack" ]; then
+    export WLR_RENDERER=vulkan
+    export VK_DRIVER_FILES=$vk_icd
+    export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+    # Turnip on the reference Android KGSL stack lacks only the Vulkan DRM
+    # identity metadata wlroots uses to pair the renderer with KMS.  The
+    # layer still refuses unless driver, capabilities and all exact rdev
+    # tuples independently match. Android may dynamically allocate KGSL's
+    # character-device major on every boot, so the exact tuple is measured
+    # from the three fixed paths instead of being hard-coded or enumerated.
+    export ANDROID_VULKAN_DRM_IDENTITY_ENABLE=1
+    export ANDROID_VULKAN_DRM_IDENTITY_ACK=$vk_identity_ack
+    export VK_LAYER_PATH=$BRIDGE_ROOT/share/vulkan/explicit_layer.d
+    export VK_INSTANCE_LAYERS=VK_LAYER_LINDEX_android_drm_identity
+    echo "renderer=vulkan icd=$vk_icd"
+else
+    [ "$renderer_policy" != vulkan ] || {
+        echo 'renderer=vulkan reason=hardware-vulkan-or-exact-device-identity-unavailable' >&2
+        exit 78
+    }
+    export WLR_RENDERER=gles2
+    # lfdevs/mesa-for-android-container names its Android KGSL Gallium path
+    # "kgsl".  Do not fall back to upstream's DRM/msm loader in the chroot.
+    export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+    echo 'renderer=gles2 reason=vulkan-unavailable-or-software'
+fi
+
+# Firefox installs the RDD seccomp filter before the libva driver is loaded.
+# Keep that sandbox intact: the RDD child consumes only preconnected protocol
+# sockets and explicit LINEAR NV12 dma-bufs. QCOM/UBWC import and the one
+# Turnip GPU repack run in this separately confined session helper.
+FIREFOX_PRELOAD=
+if [ "$ADVC_CODEC_CANDIDATE" -eq 1 ]; then
+    rm -f "$ADVC_VAAPI_SOCKET_PATH"
+    gateway_trace=0
+    [ "${ANDROID_DRM_CODEC_TRACE:-0}" = 1 ] && gateway_trace=1
+    ADVC_REPACK_GATEWAY_ENABLE=validated-qcom-nv12-v1 \
+    ADVC_REPACK_GATEWAY_OUTPUT=auto \
+    ADVC_REPACK_GATEWAY_TRACE=$gateway_trace \
+    MESA_LOADER_DRIVER_OVERRIDE=kgsl \
+    FD_KGSL_ENABLE_DMABUF=1 \
+    VK_DRIVER_FILES=${vk_icd:-} \
+        "$ADVC_REPACK_GATEWAY" "$ADVC_VAAPI_SOCKET_PATH" \
+        "$ADVC_VAAPI_UPSTREAM_SOCKET" &
+    gateway_pid=$!
+    gateway_ready=0
+    gateway_attempt=0
+    while [ "$gateway_attempt" -lt 50 ]; do
+        if [ -S "$ADVC_VAAPI_SOCKET_PATH" ]; then
+            gateway_ready=1
+            break
+        fi
+        kill -0 "$gateway_pid" 2>/dev/null || break
+        sleep 0.1
+        gateway_attempt=$((gateway_attempt + 1))
+    done
+    if [ "$gateway_ready" -eq 1 ]; then
+        export LIBVA_DRIVER_NAME=advc
+        export LIBVA_DRIVERS_PATH=$ADVC_VAAPI_DRIVER_DIR
+        export ADVC_VAAPI_SOCKET=$ADVC_VAAPI_SOCKET_PATH
+        export ADVC_VAAPI_DECODE_OUTPUT=auto
+        export ADVC_VAAPI_ENCODE_INPUT=auto
+        export ADVC_VAAPI_ASYNC_EXPORT=candidate-firefox-bframe-v1
+        export GST_VAAPI_DRM_DEVICE=/dev/dri/renderD128
+        # Android/chroot plugin-scanner IPC can drop the large VA-API feature
+        # reply and blacklist a healthy driver. Scan in-process only after the
+        # complete immutable runtime and gateway have passed their gates.
+        export GST_VAAPI_ALL_DRIVERS=1
+        export GST_REGISTRY_FORK=no
+        export GST_REGISTRY=$XDG_RUNTIME_DIR/lindex-gstreamer-advc-v2.bin
+        export ADVC_VAAPI_ENABLE_AVC=validated-v1
+        # The reference-device Main-profile B-frame matrix completed 180/180
+        # only with this exact bounded reorder contract.  It remains a narrow
+        # opt-in rather than silently changing the decoder for every profile.
+        export ADVC_VAAPI_H264_REORDER_BOUND=validated-main-reorder1-v1
+        # Public-beta HEVC Main and VP9 Profile 0 advertising is derived only
+        # from the live broker. Each bounded check requires the exact QTI
+        # component, non-secure PRIME transport and this build's successful
+        # 120/120 long-run token. A failed profile stays absent so applications
+        # retain their normal software fallback. This capability proof is not
+        # a claim that every player/display/seek lifecycle is already valid.
+        hevc_validation=validated-main-inter-prime-eos-120of120-v1
+        if hevc_preflight=$(
+            "$ADVC_DECODE_PREFLIGHT" "$ADVC_VAAPI_SOCKET_PATH" \
+                hevc-main "$hevc_validation" 2>&1
+        ); then
+            export ADVC_VAAPI_ENABLE_HEVC=$hevc_validation
+            echo "video-codec-preflight $hevc_preflight exposure=public-beta"
+        else
+            unset ADVC_VAAPI_ENABLE_HEVC
+            echo "video-codec-preflight profile=hevc-main disabled reason=live-preflight-failed detail=$hevc_preflight" >&2
+        fi
+        vp9_validation=validated-profile0-inter-prime-eos-120of120-v1
+        if vp9_preflight=$(
+            "$ADVC_DECODE_PREFLIGHT" "$ADVC_VAAPI_SOCKET_PATH" \
+                vp9-profile0 "$vp9_validation" 2>&1
+        ); then
+            export ADVC_VAAPI_ENABLE_VP9=$vp9_validation
+            echo "video-codec-preflight $vp9_preflight exposure=public-beta"
+        else
+            unset ADVC_VAAPI_ENABLE_VP9
+            echo "video-codec-preflight profile=vp9-profile0 disabled reason=live-preflight-failed detail=$vp9_preflight" >&2
+        fi
+        export ADVC_VAAPI_ENABLE_ENCODE=validated-avc-hevc-v1
+        export ADVC_VAAPI_ENABLE_GENERIC_UPLOAD=validated-nv12-v1
+        export ADVC_VAAPI_ENABLE_WRITE_EXPORT=validated-dmabuf-syncfile-v1
+        export LINDEX_FIREFOX_RDD_SOCKET_ENABLE=1
+        export LINDEX_FIREFOX_RDD_SOCKET_ACK=firefox-rdd-advc-socket-v1
+        export LINDEX_EGL_DRM_IDENTITY_ENABLE=1
+        export LINDEX_EGL_DRM_IDENTITY_ACK=kgsl-card0-renderD128-firefox-glxtest-v1
+        # These adapters are Firefox process gates, not compositor adapters.
+        # A global dlsym() interposer here changes RTLD_NEXT caller semantics
+        # for unrelated DRM preloads and can recurse during Vulkan startup.
+        # The packaged Firefox launcher applies this exact list only when it
+        # execs Firefox; RDD and glxtest children then inherit it normally.
+        FIREFOX_PRELOAD=$ADVC_FIREFOX_EGL_IDENTITY:$ADVC_FIREFOX_RDD_SOCKET
+        export LINDEX_FIREFOX_PRELOAD=$FIREFOX_PRELOAD
+        echo "video-acceleration=advc-vaapi-gateway device=$GST_VAAPI_DRM_DEVICE"
+    else
+        kill -TERM "$gateway_pid" 2>/dev/null || true
+        wait "$gateway_pid" 2>/dev/null || true
+        rm -f "$ADVC_VAAPI_SOCKET_PATH"
+        echo 'video-acceleration=disabled reason=repack-gateway-unavailable' >&2
+    fi
+fi
+
+launch_profile() {
+	# A nested shell records its own PID and then execs the compositor, so the
+	# explicit layer can distinguish that one process from Vulkan applications
+	# later spawned by the desktop. Children inherit the old owner PID and the
+	# layer remains a native pass-through for them.
+	run_vulkan_compositor() {
+		/bin/sh -c '
+			export ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID=$$
+			exec "$@"
+		' lindex-vulkan-compositor "$@"
+	}
+    if [ "${WLR_RENDERER:-}" = vulkan ] && [ "$renderer_policy" = auto ]; then
+        renderer_started=$(date +%s)
+        # This conditional form is required under `set -e`; it preserves the
+        # intended early Vulkan-to-GLES retry instead of exiting the session.
+        if run_vulkan_compositor "$@"; then renderer_rc=0; else renderer_rc=$?; fi
+        renderer_elapsed=$(($(date +%s) - renderer_started))
+        if [ "$renderer_rc" -ne 0 ] && [ "$renderer_elapsed" -le 5 ]; then
+            echo "renderer=gles2 reason=vulkan-compositor-start-failed rc=$renderer_rc elapsed=$renderer_elapsed"
+            export WLR_RENDERER=gles2
+            unset VK_DRIVER_FILES
+            unset VK_LAYER_PATH VK_INSTANCE_LAYERS
+            unset ANDROID_VULKAN_DRM_IDENTITY_ENABLE ANDROID_VULKAN_DRM_IDENTITY_ACK
+            unset ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID
+            export LD_PRELOAD=$GLES_PRELOAD
+            exec "$@"
+        fi
+        exit "$renderer_rc"
+    fi
+	if [ "${WLR_RENDERER:-}" = vulkan ]; then
+		exec /bin/sh -c '
+			export ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID=$$
+			exec "$@"
+		' lindex-vulkan-compositor "$@"
+	fi
+    exec "$@"
+}
+
+CORE=$BRIDGE_ROOT/lib/libandroid-drm-bridge.so.1
+DRM_PRELOAD=$BRIDGE_ROOT/lib/libandroid-drm-preload.so
+SEAT=$BRIDGE_ROOT/lib/libdrm_lease_seat.so
+INPUT_GRAB=$BRIDGE_ROOT/lib/libandroid-usb-input-grab.so.1
+GLES_PRELOAD=$DRM_PRELOAD:$CORE:$SEAT
+if [ "${ANDROID_DRM_USB_INPUT_MODE:-shared}" = linux-exclusive ]; then
+    if [ -r "$INPUT_GRAB" ]; then
+        GLES_PRELOAD=$INPUT_GRAB:$GLES_PRELOAD
+        export ANDROID_USB_INPUT_MODE=linux-exclusive
+    else
+        echo 'USB INPUT WARNING: exclusive-input helper is not packaged; inputs remain shared' >&2
+    fi
+fi
+export LD_PRELOAD=$GLES_PRELOAD
+
+LD_PRELOAD=$CORE:$SEAT "$BRIDGE_ROOT/bin/android-drm-bridge-probe" --lease
+LD_PRELOAD=$CORE:$SEAT "$BRIDGE_ROOT/bin/android-drm-bridge-probe" --plane "$3"
+
+case "$PROFILE" in
+    lxqt)
+        command -v labwc >/dev/null && command -v lxqt-session >/dev/null || exit 69
+        export XDG_CURRENT_DESKTOP=LXQt XDG_SESSION_DESKTOP=lxqt DESKTOP_SESSION=lxqt
+        launch_profile labwc -S '/usr/local/libexec/android-drm/start-profile-client lxqt'
+        ;;
+    xfce)
+        command -v labwc >/dev/null && command -v xfce4-session >/dev/null || exit 69
+        export XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_DESKTOP=xfce DESKTOP_SESSION=xfce
+        # Reuse Xfce's upstream labwc configuration on the lease-owning
+        # compositor.  Starting Xfce's TTY helper here would create another
+        # compositor, while omitting this configuration skips environment and
+        # session setup that the upstream Wayland entry relies on.
+        xfce_labwc_dir=${XDG_CONFIG_HOME:-$HOME/.config}/xfce4/labwc
+        mkdir -p "$xfce_labwc_dir"
+        if [ ! -f "$xfce_labwc_dir/rc.xml" ]; then
+            cp -p /usr/share/xfce4/labwc/labwc-rc.xml "$xfce_labwc_dir/rc.xml"
+        fi
+        if [ ! -f "$xfce_labwc_dir/environment" ]; then
+            cp -p /usr/share/xfce4/labwc/labwc-environment "$xfce_labwc_dir/environment"
+        fi
+        launch_profile labwc \
+            --config-dir "$xfce_labwc_dir" \
+            --config "$xfce_labwc_dir/rc.xml" \
+            -S '/usr/local/libexec/android-drm/start-profile-client xfce'
+        ;;
+    sway)
+        command -v sway >/dev/null || exit 69
+        export XDG_CURRENT_DESKTOP=sway XDG_SESSION_DESKTOP=sway DESKTOP_SESSION=sway
+        sway_config=$XDG_RUNTIME_DIR/lindex-sway.conf
+        {
+            [ ! -r /root/.config/sway/config ] || echo 'include /root/.config/sway/config'
+            if [ "${ANDROID_DRM_XWAYLAND:-0}" = 1 ]; then echo 'xwayland enable'; else echo 'xwayland disable'; fi
+        } > "$sway_config"
+        launch_profile sway --config "$sway_config"
+        ;;
+esac

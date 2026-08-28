@@ -1,0 +1,15 @@
+ANDROID_DRM_BRIDGE_1.0 {
+    global:
+        adbr_get_abi_version;
+        adbr_get_capabilities;
+        adbr_lease_dup_validate_v1;
+        adbr_lease_get_objects_v1;
+        adbr_plane_query_formats_v1;
+        adbr_preload_validate_plane_blob_v1;
+        adbr_dmabuf_validate_v1;
+        adbr_fb_import_v1;
+        adbr_fb_get_id_v1;
+        adbr_fb_destroy_v1;
+        adbr_fb_observe_v1;
+    local: *;
+};

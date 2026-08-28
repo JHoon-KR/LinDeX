@@ -1,0 +1,934 @@
+#!/bin/sh
+# LinDeX public-list profile configurator. Maintained by JHoon.
+#
+# Sway uses Archcraft's official public GPL-3.0 dotfiles at a pinned commit.
+# LXQt and XFCE use Debian's stock labwc sessions.
+set -eu
+
+apt_get() {
+    apt-get -o Acquire::http::Pipeline-Depth=0 -o Acquire::Retries=3 "$@"
+}
+
+STATE_ROOT=${ANDROID_DRM_PROFILE_STATE:-/var/lib/android-drm-lease-kit/profiles}
+TARGET_HOME=${ANDROID_DRM_PROFILE_HOME:-/root}
+RUNTIME_MANAGER=${ANDROID_DRM_PROVIDER_MANAGER:-/usr/local/libexec/android-drm/profile-runtime-manager}
+PROFILE_ASSET_ROOT=${ANDROID_DRM_PROFILE_ASSETS:-/var/cache/android-drm-lease-kit/profiles}
+SWAY_ASSET=archcraft-sway-free-e4d0126d.tar.gz
+SWAY_ASSET_SHA=da89184c13bb68affc89b2638efb2d93736dc685e4104f6a5a497c6f9e43dadc
+SWAY_SOURCE_COMMIT=e4d0126d7f236fee50a84fbb0e61498dcf5705e7
+SWAY_APPEARANCE_ASSET=lindex-archcraft-sway-public-assets-v2.tar.gz
+SWAY_APPEARANCE_SHA=4b84564c692e270bb46bbc36c4e5f9b1684c5ed4f1d8bcbf053698780a0af08c
+ACTION=install
+PROFILE=
+PACKAGE_MODE=install
+PROGRESS_FILE=${ANDROID_DRM_PROGRESS_FILE:-}
+SWAY_THEME=${ANDROID_DRM_SWAY_THEME:-dark}
+case "$SWAY_THEME" in dark|light|pywal) ;; *) SWAY_THEME=dark ;; esac
+
+write_progress() {
+    [ -n "$PROGRESS_FILE" ] || return 0
+    percent=$1 stage=$2 detail=$3
+    mkdir -p "${PROGRESS_FILE%/*}"
+    progress_tmp=$PROGRESS_FILE.tmp.$$
+    {
+        echo 'format=1'
+        echo "profile=$PROFILE"
+        echo "percent=$percent"
+        echo "stage=$stage"
+        echo "detail=$detail"
+        echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$progress_tmp"
+    chmod 0600 "$progress_tmp" 2>/dev/null || true
+    mv -f "$progress_tmp" "$PROGRESS_FILE"
+}
+
+usage() {
+    cat <<'EOF'
+usage:
+  profile-configurator install --profile PROFILE [--package-mode install|check]
+  profile-configurator packages --profile PROFILE
+  profile-configurator runtime-packages --profile PROFILE
+  profile-configurator status --profile PROFILE
+
+PROFILE: sway | lxqt | xfce
+EOF
+}
+
+die_usage() { usage >&2; exit 64; }
+case "${1:-}" in install|packages|runtime-packages|status) ACTION=$1; shift ;; esac
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --profile) [ "$#" -ge 2 ] || die_usage; PROFILE=$2; shift 2 ;;
+        --package-mode) [ "$#" -ge 2 ] || die_usage; PACKAGE_MODE=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die_usage ;;
+    esac
+done
+case "$PROFILE" in sway|lxqt|xfce) ;; *) die_usage ;; esac
+case "$PACKAGE_MODE" in install|check) ;; *) die_usage ;; esac
+
+# Public composition name | Debian Trixie package.  This list intentionally
+# contains only the programs named by the selected public profile (or by the
+# LinDeX LXQt/XFCE profile).  Transitive ABI/runtime dependencies live in
+# runtime_manifest() and are never presented as extra profile applications.
+composition_manifest() {
+    case "$PROFILE" in
+        sway)
+            cat <<'EOF'
+sway|sway
+swaybg|swaybg
+swayidle|swayidle
+swaylock|swaylock
+xorg-xwayland|xwayland
+hyprpicker|hyprpicker
+hyprlock|hyprlock
+wl-clipboard|wl-clipboard
+waybar|waybar
+wofi|wofi
+kanshi|kanshi
+foot|foot
+mako|mako-notifier
+grim|grim
+slurp|slurp
+wf-recorder|wf-recorder
+light|light
+yad|yad
+wlogout|wlogout
+thunar|thunar
+geany|geany
+mpv|mpv
+mpd|mpd
+mpc|mpc
+viewnior|viewnior
+imagemagick|imagemagick
+xdg-desktop-portal|xdg-desktop-portal
+xdg-desktop-portal-wlr|xdg-desktop-portal-wlr
+xdg-desktop-portal-gtk|xdg-desktop-portal-gtk
+playerctl|playerctl
+pastel|-
+python-pywal|-
+alacritty|alacritty
+rofi|rofi
+pulsemixer|pulsemixer
+EOF
+            ;;
+        lxqt)
+            cat <<'EOF'
+labwc|labwc
+wlr-randr|wlr-randr
+xorg-xwayland|xwayland
+foot|foot
+vkmark|vkmark
+vulkan-tools|vulkan-tools
+mesa-utils|mesa-utils
+desktop-file-utils|desktop-file-utils
+gvfs|gvfs
+lxqt-config|lxqt-config
+lxqt-globalkeys|lxqt-globalkeys
+lxqt-notificationd|lxqt-notificationd
+lxqt-panel|lxqt-panel
+lxqt-qtplugin|lxqt-qtplugin
+lxqt-runner|lxqt-runner
+lxqt-session|lxqt-session
+lxqt-system-theme|lxqt-system-theme
+lxqt-themes|lxqt-themes
+pcmanfm-qt|pcmanfm-qt
+qterminal|qterminal
+qtxdg-tools|qtxdg-tools
+qt6-wayland|qt6-wayland
+layer-shell-qt|layer-shell-qt
+adwaita-icon-theme|adwaita-icon-theme
+EOF
+            ;;
+        xfce)
+            cat <<'EOF'
+labwc|labwc
+wlr-randr|wlr-randr
+xorg-xwayland|xwayland
+foot|foot
+vkmark|vkmark
+vulkan-tools|vulkan-tools
+mesa-utils|mesa-utils
+xfce4|xfce4
+xfce4-terminal|xfce4-terminal
+EOF
+            ;;
+    esac
+}
+
+# Private implementation dependencies that are not presented as profile apps.
+runtime_manifest() {
+    case "$PROFILE" in
+        sway)
+            cat <<'EOF'
+jetbrains-mono-font|fonts-jetbrains-mono
+noto-font|fonts-noto-core
+font-awesome|fonts-font-awesome
+noto-color-emoji|fonts-noto-color-emoji
+notify-send|libnotify-bin
+EOF
+            ;;
+    esac
+}
+
+install_manifest() {
+    composition_manifest
+    runtime_manifest
+}
+
+status_path() { printf '%s/%s.status\n' "$STATE_ROOT" "$PROFILE"; }
+ready_path() { printf '%s/%s.ready\n' "$STATE_ROOT" "$PROFILE"; }
+profile_appearance() {
+    case "$PROFILE" in
+        sway) printf '%s\n' archcraft-official-public-dotfiles ;;
+        lxqt|xfce) printf '%s\n' debian-stock ;;
+        *) printf '%s\n' unsupported ;;
+    esac
+}
+profile_detail() {
+    case "$PROFILE" in
+        sway) printf '%s\n' archcraft-sway-free-official-gpl3-debian-adapted ;;
+        lxqt|xfce) printf '%s\n' debian-packages-and-command-verification ;;
+        *) printf '%s\n' public-packages-and-lindex-defaults ;;
+    esac
+}
+profile_requirement() {
+    case "$PROFILE" in
+        sway) printf '%s\n' package-command-and-appearance-verified ;;
+        *) printf '%s\n' package-and-command-verified ;;
+    esac
+}
+debian_mappings() {
+    case "$PROFILE" in
+        sway)
+            printf '%s\n' 'mako:mako-notifier,xorg-xwayland:xwayland,python-pywal:pywal16'
+            ;;
+        lxqt|xfce)
+            printf '%s\n' 'xorg-xwayland:xwayland'
+            ;;
+    esac
+}
+write_status() {
+    state=$1 detail=$2 missing=${3:-}
+    mkdir -p "$STATE_ROOT"
+    path=$(status_path); tmp=$path.tmp.$$
+    {
+        echo 'format=2'
+        echo "profile=$PROFILE"
+        echo "state=$state"
+        echo "detail=$detail"
+        echo "missing_upstream_packages=$missing"
+        echo "appearance=$(profile_appearance)"
+        echo "debian_mappings=$(debian_mappings)"
+        echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$tmp"
+    chmod 0600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$path"
+}
+
+if [ "$ACTION" = packages ]; then composition_manifest; exit 0; fi
+if [ "$ACTION" = runtime-packages ]; then runtime_manifest; exit 0; fi
+if [ "$ACTION" = status ]; then
+    if [ -r "$(status_path)" ]; then cat "$(status_path)"
+    elif [ -r "$(ready_path)" ]; then cat "$(ready_path)"
+    else printf 'format=2\nprofile=%s\nstate=not-installed\n' "$PROFILE"
+    fi
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo 'root is required' >&2; exit 1; }
+case "$TARGET_HOME" in /root|/home/*) ;; *) echo 'unsafe profile home' >&2; exit 64 ;; esac
+case "$PROFILE" in
+    sway)
+        [ -x "$RUNTIME_MANAGER" ] || { write_status dependency-required runtime-manager; exit 67; }
+        runtime_rc=0
+        write_progress 64 profile-runtime verifying-bundled-and-public-runtimes
+        "$RUNTIME_MANAGER" ensure --profile "$PROFILE" || runtime_rc=$?
+        if [ "$runtime_rc" -ne 0 ]; then
+            rc=$runtime_rc
+            write_status profile-unavailable "runtime-manager-exit-$rc" runtime-family
+            exit "$rc"
+        fi
+        ;;
+    *) write_progress 64 profile-runtime using-debian-stock-runtime ;;
+esac
+
+write_progress 69 profile-dependencies resolving-profile-packages
+
+package_installed() {
+    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -qx 'install ok installed'
+}
+provider_present() {
+    upstream=$1 candidate=$2
+    case "$upstream" in
+        python-pywal) command -v wal >/dev/null 2>&1 ;;
+        xorg-xwayland) command -v Xwayland >/dev/null 2>&1 ;;
+        wl-clipboard) command -v wl-copy >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1 ;;
+        imagemagick) command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1 ;;
+        xdg-desktop-portal|xdg-desktop-portal-wlr|xdg-desktop-portal-gtk|\
+        wlroots-0.18|lib*|python-*|desktop-file-utils|gvfs|lxqt-config|\
+        lxqt-globalkeys|lxqt-notificationd|lxqt-panel|lxqt-qtplugin|lxqt-runner|\
+        lxqt-session|lxqt-system-theme|lxqt-themes|pcmanfm-qt|qterminal|\
+        qtxdg-tools|qt6-wayland|layer-shell-qt|adwaita-icon-theme|xfce4|\
+        jetbrains-mono-font|noto-font|font-awesome|\
+        noto-color-emoji|notify-send)
+            [ "$candidate" != - ] && package_installed "$candidate"
+            ;;
+        vulkan-tools) command -v vulkaninfo >/dev/null 2>&1 ;;
+        mesa-utils) command -v glxinfo >/dev/null 2>&1 || command -v eglinfo >/dev/null 2>&1 ;;
+        xfce4) command -v xfce4-session >/dev/null 2>&1 ;;
+        hyprpicker|hyprlock)
+            [ "$candidate" != - ] && package_installed "$candidate" &&
+                command -v "$upstream" >/dev/null 2>&1
+            ;;
+        sway|swaybg|swayidle|swaylock|waybar|wofi|kanshi|\
+        foot|mako|grim|slurp|wf-recorder|light|yad|thunar|geany|mpv|\
+        wlogout|mpd|mpc|viewnior|playerctl|pastel|alacritty|rofi|pulsemixer|\
+        wlr-randr|wtype|labwc|vkmark|xfce4-terminal)
+            command -v "$upstream" >/dev/null 2>&1
+            ;;
+        *) [ "$candidate" != - ] && package_installed "$candidate" ;;
+    esac
+}
+
+# Pre-release LinDeX builds provided these two small compatibility scripts in
+# /usr/local/bin.  Their presence must not satisfy the public package contract
+# or shadow the native Debian backports binaries after an upgrade.  Remove only
+# the exact LinDeX-owned hashes; never delete an unknown user-managed file.
+remove_legacy_hypr_wrappers() {
+    while IFS='|' read -r name expected; do
+        path=/usr/local/bin/$name
+        [ -f "$path" ] && [ ! -L "$path" ] || continue
+        actual=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+        [ "$actual" = "$expected" ] || continue
+        rm -f -- "$path"
+    done <<'EOF'
+hyprpicker|0432b6f49bff0028a86cae6e15439c460163c21769a13c95f1892c587ee74d17
+hyprlock|03d649a8357a585369386c7016c3374aaa43d849aee0ebf1ee602dae2ae2c987
+EOF
+}
+
+needs_hypr_backports() {
+    composition_manifest | grep -Eq '^(hyprpicker|hyprlock)\|'
+}
+
+ensure_hypr_backports() {
+    needs_hypr_backports || return 0
+    apt-cache show hyprpicker >/dev/null 2>&1 &&
+        apt-cache show hyprlock >/dev/null 2>&1 && return 0
+    [ "$PACKAGE_MODE" = install ] || return 0
+    source_file=/etc/apt/sources.list.d/lindex-trixie-backports.sources
+    if [ -e "$source_file" ] &&
+       ! grep -q '^# Managed by LinDeX profile configurator$' "$source_file"; then
+        write_status conflict unowned-trixie-backports-source
+        exit 69
+    fi
+    install -d -m 0755 /etc/apt/sources.list.d
+    cat > "$source_file.tmp.$$" <<'EOF'
+# Managed by LinDeX profile configurator
+Types: deb
+URIs: https://deb.debian.org/debian
+Suites: trixie-backports
+Components: main
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    chmod 0644 "$source_file.tmp.$$"
+    mv -f "$source_file.tmp.$$" "$source_file"
+    write_progress 70 profile-packages enabling-debian-backports
+    apt_get update || { write_status dependency-install-failed apt-update-backports; exit 68; }
+}
+
+remove_legacy_hypr_wrappers
+ensure_hypr_backports
+
+AVAILABLE=$(mktemp /tmp/lindex-profile-packages.XXXXXX)
+MISSING=$(mktemp /tmp/lindex-profile-missing.XXXXXX)
+trap 'rm -f -- "$AVAILABLE" "$MISSING"' EXIT HUP INT TERM
+: > "$AVAILABLE"; : > "$MISSING"
+while IFS='|' read -r upstream candidate; do
+    provider_present "$upstream" "$candidate" && continue
+    if [ "$candidate" != - ] && apt-cache show "$candidate" >/dev/null 2>&1; then
+        grep -qxF "$candidate" "$AVAILABLE" || echo "$candidate" >> "$AVAILABLE"
+    else
+        echo "$upstream" >> "$MISSING"
+    fi
+done <<EOF
+$(install_manifest)
+EOF
+
+if [ "$PACKAGE_MODE" = install ] && [ -s "$AVAILABLE" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    write_progress 72 profile-packages refreshing-debian-packages
+    apt_get update || { write_status dependency-install-failed apt-update; exit 68; }
+    # Package names come exclusively from the embedded allowlist above.
+    # shellcheck disable=SC2046
+    write_progress 76 profile-packages installing-profile-packages
+    apt_get install -y --no-install-recommends $(tr '\n' ' ' < "$AVAILABLE") || {
+        write_status dependency-install-failed apt-install
+        exit 68
+    }
+fi
+
+write_progress 88 profile-configuration configuring-profile-commands
+
+: > "$MISSING"
+while IFS='|' read -r upstream candidate; do
+    provider_present "$upstream" "$candidate" || echo "$upstream" >> "$MISSING"
+done <<EOF
+$(install_manifest)
+EOF
+missing=$(paste -sd, "$MISSING" 2>/dev/null || true)
+if [ -n "$missing" ]; then
+    write_status dependency-required missing-public-runtime "$missing"
+    exit 67
+fi
+
+[ ! -L "$TARGET_HOME/.config" ] || { write_status conflict symlink-config-root; exit 69; }
+write_progress 92 profile-configuration writing-profile-defaults
+mkdir -p "$TARGET_HOME/.config"
+
+install_official_sway_appearance() {
+    appearance_archive=$PROFILE_ASSET_ROOT/$SWAY_APPEARANCE_ASSET
+    appearance_digest=$appearance_archive.sha256
+    [ -r "$appearance_archive" ] && [ -r "$appearance_digest" ] || {
+        write_status profile-unavailable missing-archcraft-sway-appearance
+        return 67
+    }
+    [ "$(sha256sum "$appearance_archive" | awk '{print $1}')" = "$SWAY_APPEARANCE_SHA" ] || {
+        write_status profile-unavailable invalid-archcraft-sway-appearance
+        return 67
+    }
+
+    appearance_marker=$STATE_ROOT/archcraft-sway-appearance.ready
+    if [ -r "$appearance_marker" ] &&
+       grep -qx "archive_sha256=$SWAY_APPEARANCE_SHA" "$appearance_marker" &&
+       [ -d /usr/share/themes/Sweet-Ambar-Blue ] &&
+       [ -d /usr/share/themes/Qogir-Light ] &&
+       [ -d /usr/share/icons/Ars ] && [ -d /usr/share/icons/Sweet ] &&
+       [ -d /usr/share/icons/Qogir ] && [ -d /usr/share/icons/Archcraft ] &&
+       [ -d /usr/share/icons/Qogirr-Dark ]; then
+        return 0
+    fi
+    for path in /usr/share/themes/Sweet-Ambar-Blue /usr/share/themes/Qogir-Light \
+        /usr/share/icons/Ars /usr/share/icons/Sweet /usr/share/icons/Qogir \
+        /usr/share/icons/Archcraft /usr/share/icons/Qogirr-Dark; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || {
+            write_status conflict existing-archcraft-appearance-preserved "$path"
+            return 69
+        }
+    done
+
+    stage=$(mktemp -d /tmp/lindex-archcraft-appearance.XXXXXX)
+    manifest=$stage/archive.list
+    tar -tzf "$appearance_archive" > "$manifest"
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' "$manifest" ||
+       grep -Evq '^lindex-archcraft-sway-public-assets(/|$)' "$manifest"; then
+        rm -rf -- "$stage"
+        write_status profile-unavailable unsafe-archcraft-sway-appearance
+        return 67
+    fi
+    tar -xzf "$appearance_archive" -C "$stage"
+    source=$stage/lindex-archcraft-sway-public-assets
+    [ -d "$source/usr/share/themes/Sweet-Ambar-Blue" ] &&
+       [ -d "$source/usr/share/themes/Qogir-Light" ] &&
+       [ -d "$source/usr/share/icons/Ars" ] &&
+       [ -d "$source/usr/share/icons/Sweet" ] &&
+       [ -d "$source/usr/share/icons/Qogir" ] &&
+       [ -d "$source/usr/share/icons/Archcraft" ] &&
+       [ -d "$source/usr/share/icons/Qogirr-Dark" ] || {
+        rm -rf -- "$stage"
+        write_status profile-unavailable incomplete-archcraft-sway-appearance
+        return 67
+    }
+    mkdir -p /usr/share/themes /usr/share/icons \
+        /usr/share/doc/lindex/archcraft-sway-public-assets
+    cp -a "$source/usr/share/themes/Sweet-Ambar-Blue" \
+        "$source/usr/share/themes/Qogir-Light" /usr/share/themes/
+    cp -a "$source/usr/share/icons/Ars" "$source/usr/share/icons/Sweet" \
+        "$source/usr/share/icons/Qogir" "$source/usr/share/icons/Archcraft" \
+        "$source/usr/share/icons/Qogirr-Dark" /usr/share/icons/
+    cp -a "$source/licenses/." "$source/SOURCES.lock" \
+        /usr/share/doc/lindex/archcraft-sway-public-assets/
+    {
+        echo 'format=1'
+        echo "archive_sha256=$SWAY_APPEARANCE_SHA"
+        echo 'gtk_theme=Sweet-Ambar-Blue'
+        echo 'icon_theme=Ars'
+        echo 'cursor_theme=Sweet'
+        echo 'light_gtk_theme=Qogir-Light'
+        echo 'light_icon_theme=Qogir'
+        echo 'light_icon_fallback_theme=Archcraft'
+        echo 'light_cursor_theme=Qogirr-Dark'
+    } > "$appearance_marker.tmp.$$"
+    chmod 0644 "$appearance_marker.tmp.$$"
+    mv -f "$appearance_marker.tmp.$$" "$appearance_marker"
+    rm -rf -- "$stage"
+}
+
+write_sway_runtime_scripts() {
+    runtime_target=$1
+    cat > "$runtime_target/scripts/startup" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+# The compositor owns the lease. Desktop daemons must not keep its inherited
+# hand-off descriptor alive after Sway exits or a DP reconnect will hit EBUSY.
+case "${DRM_LEASE_FD:-}" in
+    ''|*[!0-9]*) ;;
+    *) (( DRM_LEASE_FD < 3 )) || eval "exec ${DRM_LEASE_FD}>&-" ;;
+esac
+unset DRM_LEASE_FD DRM_LEASE_LESSEE_ID DRM_LEASE_OBJECTS DRM_LEASE_DEVICE
+
+run() {
+    command -v "$1" >/dev/null 2>&1 || return 0
+    pgrep -x "$1" >/dev/null 2>&1 || "$@" &
+}
+
+restart() {
+    local proc="$1"
+    shift
+    command -v "$proc" >/dev/null 2>&1 || return 0
+    pkill -TERM -x "$proc" >/dev/null 2>&1 || true
+    "$@" >/dev/null 2>&1 &
+}
+
+restart waybar "$HOME/.config/sway/scripts/statusbar"
+restart mako "$HOME/.config/sway/scripts/notifications"
+exit 0
+EOF
+    cat > "$runtime_target/scripts/android_battery" <<'EOF'
+#!/usr/bin/env bash
+# Samsung exposes a valid capacity value but also reports charge_now=0.
+# Waybar 0.12 prefers charge_now/charge_full and therefore displays 0%.
+# Read the canonical Android capacity directly without modifying sysfs.
+set -u
+battery=/sys/class/power_supply/battery
+capacity=$(cat "$battery/capacity" 2>/dev/null || printf '?')
+status=$(cat "$battery/status" 2>/dev/null || printf 'Unknown')
+case "$capacity" in
+    ''|*[!0-9]*) printf '?\n'; exit 0 ;;
+esac
+if [ "$capacity" -gt 100 ]; then capacity=100; fi
+if [ "$capacity" -lt 0 ]; then capacity=0; fi
+case "$status" in
+    Charging) icon='' ;;
+    Full) icon='' ;;
+    *)
+        if [ "$capacity" -le 10 ]; then icon=''
+        elif [ "$capacity" -le 35 ]; then icon=''
+        elif [ "$capacity" -le 60 ]; then icon=''
+        elif [ "$capacity" -le 85 ]; then icon=''
+        else icon=''
+        fi
+        ;;
+esac
+printf '%s %s%%\n' "$icon" "$capacity"
+EOF
+    cat > "$runtime_target/scripts/android_volume" <<'EOF'
+#!/usr/bin/env bash
+# Display Android's STREAM_MUSIC volume without opening an ALSA/Pulse device.
+set -u
+state=${ANDROID_VOLUME_STATE:-/run/android-drm/android-volume.state}
+volume=
+maximum=
+updated=
+if [[ -r "$state" ]]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            volume) volume=$value ;;
+            maximum) maximum=$value ;;
+            updated) updated=$value ;;
+        esac
+    done < "$state"
+fi
+case "$volume:$maximum:$updated" in
+    *[!0-9:]*) printf ' --\n'; exit 0 ;;
+esac
+(( maximum > 0 && volume <= maximum )) || { printf ' --\n'; exit 0; }
+now=$(date +%s)
+(( now - updated <= 5 )) || { printf ' --\n'; exit 0; }
+percent=$((volume * 100 / maximum))
+if (( volume == 0 )); then icon=''
+elif (( percent < 50 )); then icon=''
+else icon=''
+fi
+printf '%s %s%%\n' "$icon" "$percent"
+EOF
+    cat > "$runtime_target/scripts/android_volume_control" <<'EOF'
+#!/usr/bin/env bash
+# Queue a bounded Android STREAM_MUSIC volume action for the host watcher.
+set -u
+case "${1:-}" in raise|lower|toggle) action=$1 ;; *) exit 2 ;; esac
+commands=${ANDROID_VOLUME_COMMANDS:-/run/android-drm/android-volume-commands}
+[[ -d "$commands" && -w "$commands" ]] || exit 0
+stamp=$(date +%s%N 2>/dev/null || printf '%s' "$$")
+temporary=$commands/.volume-$$-$stamp.tmp
+target=$commands/volume-$$-$stamp.cmd
+umask 077
+printf '%s\n' "$action" > "$temporary" || exit 0
+mv -f "$temporary" "$target"
+EOF
+    cat > "$runtime_target/scripts/rofi_powermenu" <<'EOF'
+#!/usr/bin/env bash
+# LinDeX safety adapter for the Archcraft visual power menu.  Android owns
+# suspend, hibernate, reboot and poweroff; this chroot menu may only log out.
+choice=$(printf 'Logout\nCancel\n' | rofi -dmenu -p 'LinDeX session')
+[[ "$choice" == Logout ]] && swaymsg exit
+exit 0
+EOF
+    chmod 0755 "$runtime_target/scripts"/* "$runtime_target/theme/theme.sh" \
+        "$runtime_target/waybar/spotify" "$runtime_target/waybar/lightmode"
+}
+
+adapt_sway_waybar_for_android() {
+    sway_config=$1/config
+    waybar_config=$1/waybar/config
+    waybar_modules=$1/waybar/modules
+    waybar_style=$1/waybar/style.css
+    waybar_lightmode=$1/waybar/lightmode
+    [ -f "$waybar_config" ] || return 0
+
+    # The external desktop runs inside a chroot while Android owns networking,
+    # Bluetooth and display brightness. Debian's Waybar Bluetooth module attempts to
+    # create a BlueZ system-bus object manager; without a chroot system bus,
+    # the packaged Waybar build can abort the entire bar.  Do not instantiate
+    # Android-owned modules. The Sway session must not inspect wlan interfaces,
+    # run a NetworkManager client, or retain a network-menu helper.
+    sed -i \
+        -e 's/, "mpd"//g' \
+        -e 's/"mpd", //g' \
+        -e 's/, "backlight"//g' \
+        -e 's/"backlight", //g' \
+        -e 's/, "bluetooth"//g' \
+        -e 's/"bluetooth", //g' \
+        -e 's/, "network"//g' \
+        -e 's/"network", //g' \
+        -e 's/"battery"/"custom\/android-battery"/g' \
+        -e 's/"pulseaudio"/"custom\/android-volume"/g' \
+        "$waybar_config"
+
+    if [ -f "$sway_config" ]; then
+        sed -i \
+            -e 's|^set \$rofi_network .*|# LinDeX: Sway network access is disabled; Android owns networking.|' \
+            -e 's|^bindsym \$mod+n .*|# LinDeX: Sway network access is disabled; Android owns networking.|' \
+            "$sway_config"
+    fi
+    rm -f "$1/scripts/rofi_network"
+
+    # Android exposes several charger/fuel-gauge power_supply entries and
+    # policy-routing tables whose main-table default is dummy0.  Waybar's
+    # generic auto-detection can therefore select an auxiliary supply and
+    # report Wi-Fi as disconnected even though the real Android battery and
+    # wlan0 are healthy. Samsung also exposes charge_now=0 beside a valid
+    # capacity value, while Waybar 0.12 prioritizes charge_now/charge_full and
+    # renders 0%. Use the bounded Android-capacity helper and keep the official
+    # styling. Replace the disconnected Pulse client with Android STREAM_MUSIC
+    # volume state/control; this does not start MPD/PulseAudio, open an ALSA
+    # device, or mount Android's cmd, /system, or /apex into the chroot. The
+    # Remove the network object as well as its module-list entry. This is
+    # intentionally stronger than a read-only widget: Sway must make no wlan,
+    # route, gateway, or NetworkManager queries while Android owns networking.
+    if [ -f "$waybar_modules" ]; then
+        sed -i \
+            -e 's|//"bat": "BAT1",|"bat": "battery",|' \
+            -e '/^[[:space:]]*"adapter":[[:space:]]*"[^"]*",/d' \
+            -e 's///g' \
+            -e 's/漣//g' \
+            -e 's/ﳴ//g' \
+            "$waybar_modules"
+        sed -i \
+            '/^[[:space:]]*"network":[[:space:]]*[{][[:space:]]*$/,/^[[:space:]]*},[[:space:]]*$/d' \
+            "$waybar_modules"
+        # Insert custom objects before the pinned final tray object. Appending
+        # before the root closing brace would omit the comma after tray and
+        # make the JSONC invalid.
+        sed -i '/^    "custom\/android-battery": {$/,/^    },$/d' \
+            "$waybar_modules"
+        sed -i '/^    "tray": {$/i\
+    "custom/android-battery": {\
+        "exec": "$HOME/.config/sway/scripts/android_battery",\
+        "interval": 10,\
+        "format": "{}",\
+        "tooltip": false,\
+    },' "$waybar_modules"
+        # Rebuild this object on every adaptation. This also repairs the early
+        # pre-release adapter which renamed the PulseAudio object key but left
+        # Pulse-only format fields and pulsemixer click handlers behind.
+        sed -i '/^    "custom\/android-volume": {$/,/^    },$/d' \
+            "$waybar_modules"
+        sed -i '/^    "tray": {$/i\
+    "custom/android-volume": {\
+        "exec": "$HOME/.config/sway/scripts/android_volume",\
+        "interval": 2,\
+        "format": "{}",\
+        "on-click": "$HOME/.config/sway/scripts/android_volume_control toggle",\
+        "on-scroll-up": "$HOME/.config/sway/scripts/android_volume_control raise",\
+        "on-scroll-down": "$HOME/.config/sway/scripts/android_volume_control lower",\
+        "tooltip": false,\
+    },' "$waybar_modules"
+    fi
+    # Archcraft's light-mode helper uses a Material Design Nerd Font sun
+    # (U+F05A8) while the Debian adapter deliberately selects FontAwesome.
+    # Use the Font Awesome 4 sun-o glyph so the button remains visible without
+    # adding an otherwise unnecessary Nerd Font package to every rootfs.
+    if [ -f "$waybar_lightmode" ]; then
+        sed -i 's/󰖨//g' "$waybar_lightmode"
+    fi
+    if [ -f "$waybar_style" ]; then
+        sed -i \
+            -e 's/"Symbols Nerd Font"/"FontAwesome"/g' \
+            -e 's/"Font Awesome 6 Free"/"FontAwesome"/g' \
+            -e 's/#pulseaudio/#custom-android-volume/g' \
+            "$waybar_style"
+        if ! grep -q '^#custom-android-battery {' "$waybar_style"; then
+            cat >> "$waybar_style" <<'EOF'
+
+/* LinDeX canonical Android battery capacity helper. */
+#custom-android-battery {
+    background-color: @background-alt;
+    color: @foreground;
+    border-radius: 8px;
+    margin: 6px 0px;
+    padding: 2px 10px;
+}
+EOF
+        fi
+        if ! grep -q '^#custom-android-volume {' "$waybar_style"; then
+            cat >> "$waybar_style" <<'EOF'
+
+/* Android STREAM_MUSIC volume; no Linux audio device is opened. */
+#custom-android-volume {
+    background-color: @background-alt;
+    color: @foreground;
+    border-radius: 8px;
+    margin: 6px 0px;
+    padding: 2px 10px;
+}
+EOF
+        fi
+    fi
+}
+
+normalize_profile_text_files() {
+    normalize_root=$1
+    find "$normalize_root" -type f -exec sh -c '
+        for text_file do
+            if LC_ALL=C grep -Iq . "$text_file"; then
+                sed -i "s/\r$//" "$text_file"
+            fi
+        done
+    ' sh {} +
+}
+
+install_official_sway_profile() {
+    sway_archive=$PROFILE_ASSET_ROOT/$SWAY_ASSET
+    sway_digest=$sway_archive.sha256
+    [ -r "$sway_archive" ] && [ -r "$sway_digest" ] || {
+        write_status profile-unavailable missing-archcraft-sway-public-asset archcraft-sway-free
+        return 67
+    }
+    [ "$(sha256sum "$sway_archive" | awk '{print $1}')" = "$SWAY_ASSET_SHA" ] || {
+        write_status profile-unavailable invalid-archcraft-sway-public-asset archcraft-sway-free
+        return 67
+    }
+
+    install_official_sway_appearance || return $?
+
+    target=$TARGET_HOME/.config/sway
+    source_marker=$target/.lindex-source
+    if [ -r "$source_marker" ] &&
+       grep -qx "source_commit=$SWAY_SOURCE_COMMIT" "$source_marker" &&
+       [ -r "$target/config" ] && [ -r "$target/sway-output" ] &&
+       [ -r "$target/waybar/config" ] && [ -r "$target/wallpapers/wallpaper.jpg" ]; then
+        normalize_profile_text_files "$target"
+        adapt_sway_waybar_for_android "$target"
+        write_sway_runtime_scripts "$target"
+        sed -i \
+            's/^adapter=.*/adapter=debian-no-sov-no-welcome-safe-power-no-auto-dpms-no-android-waybar-modules-no-linux-network-access-v2-android-status-fa4-battery-v2-android-volume-v1-fa4-lightmode-v1/' \
+            "$source_marker"
+        return 0
+    fi
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        [ ! -L "$target" ] || { write_status conflict symlink-sway-config; return 69; }
+        if [ -r "$target/config" ] &&
+           grep -q '^# LinDeX minimal free Sway profile\.' "$target/config"; then
+            backup=$TARGET_HOME/.config/sway.lindex-minimal-backup-$(date +%Y%m%d%H%M%S)-$$
+            mv "$target" "$backup"
+        else
+            write_status conflict existing-sway-config-preserved
+            return 69
+        fi
+    fi
+
+    stage=$(mktemp -d /tmp/lindex-archcraft-sway.XXXXXX)
+    manifest=$stage/archive.list
+    tar -tzf "$sway_archive" > "$manifest"
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' "$manifest" ||
+       grep -Evq '^archcraft-sway-free(/|$)' "$manifest"; then
+        rm -rf -- "$stage"
+        write_status profile-unavailable unsafe-archcraft-sway-public-asset
+        return 67
+    fi
+    tar -xzf "$sway_archive" -C "$stage"
+    source=$stage/archcraft-sway-free/files
+    [ -r "$source/config" ] && [ -r "$source/sway-output" ] &&
+        [ -r "$source/waybar/config" ] && [ -r "$source/wallpapers/wallpaper.jpg" ] || {
+            rm -rf -- "$stage"
+            write_status profile-unavailable incomplete-archcraft-sway-public-asset
+            return 67
+        }
+
+    mkdir -p "$target"
+    cp -a "$source/." "$target/"
+
+    # Archives prepared on a Windows host can retain CRLF in executable and
+    # configuration files.  Normalize text files only; wallpapers and other
+    # binary assets must remain byte-for-byte intact.
+    normalize_profile_text_files "$target"
+
+    # Debian/chroot compatibility adapter.  Keep Archcraft's visual files and
+    # bindings, but replace Arch-only service paths and disable the unavailable
+    # Sway Overview helper instead of allowing startup errors.
+    sed -i \
+        -e 's|^include ~/.config/sway/sway-idle|# LinDeX: automatic lock/DPMS is disabled for leased external outputs.|' \
+        -e 's|^exec rm -f /tmp/sovpipe.*|# LinDeX Debian adapter: Sway Overview (sov) is unavailable.|' \
+        -e 's|; exec "echo 1 > /tmp/sovpipe"||' \
+        -e 's|^bindsym --release \(.*tmp/sovpipe.*\)$|# LinDeX Debian adapter: \1|' \
+        -e 's|^bindsym \$mod+n .*|# LinDeX: Android owns NetworkManager; network menu disabled.|' \
+        -e 's|^bindsym \$mod+b .*|# LinDeX: Android owns Bluetooth; Bluetooth menu disabled.|' \
+        -e 's|^bindsym XF86MonBrightnessUp .*|# LinDeX: Android owns internal brightness controls.|' \
+        -e 's|^bindsym XF86MonBrightnessDown .*|# LinDeX: Android owns internal brightness controls.|' \
+        "$target/config"
+    for font_config in "$target/foot/fonts.ini" "$target/alacritty/fonts.toml" \
+        "$target/kitty/fonts.conf" "$target/hyprlock.conf"; do
+        [ -f "$font_config" ] || continue
+        sed -i \
+            -e 's/JetBrainsMono Nerd Font/JetBrains Mono/g' \
+            -e 's/FiraCode Nerd Font/JetBrains Mono/g' \
+            -e 's/Iosevka Nerd Font/JetBrains Mono/g' \
+            -e 's/Symbols Nerd Font/FontAwesome/g' \
+            "$font_config"
+    done
+    sed -i 's/"Symbols Nerd Font"/"FontAwesome"/' "$target/waybar/style.css"
+    adapt_sway_waybar_for_android "$target"
+    write_sway_runtime_scripts "$target"
+    {
+        echo 'format=1'
+        echo 'source=https://github.com/archcraft-os/archcraft-sway'
+        echo "source_commit=$SWAY_SOURCE_COMMIT"
+        echo "archive_sha256=$SWAY_ASSET_SHA"
+        echo 'license=GPL-3.0'
+        echo 'adapter=debian-no-sov-no-welcome-safe-power-no-auto-dpms-no-android-waybar-modules-no-linux-network-access-v2-android-status-fa4-battery-v2-android-volume-v1-fa4-lightmode-v1'
+    } > "$source_marker"
+    owner=$(stat -c '%u:%g' "$TARGET_HOME")
+    chown -R "$owner" "$target"
+    rm -rf -- "$stage"
+}
+
+apply_official_sway_theme() {
+    target=$TARGET_HOME/.config/sway
+    theme_script=$target/theme/theme.sh
+    [ -x "$theme_script" ] && [ -r "$target/theme/default.bash" ] &&
+        [ -r "$target/theme/light.bash" ] || {
+        write_status profile-unavailable incomplete-archcraft-sway-theme
+        return 67
+    }
+
+    # Archcraft's Pywal mode expects a user wallpaper directory. Keep user
+    # images untouched and seed an empty directory with the two public bundled
+    # wallpapers so auto-generation works on a fresh chroot.
+    wallpaper_dir=$TARGET_HOME/Pictures/wallpapers
+    mkdir -p "$wallpaper_dir"
+    if ! find "$wallpaper_dir" -maxdepth 1 -type f \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o \
+           -iname '*.webp' -o -iname '*.bmp' \) -print -quit | grep -q .; then
+        cp -f "$target/wallpapers/wallpaper.jpg" "$wallpaper_dir/archcraft-dark.jpg"
+        cp -f "$target/wallpapers/light.jpg" "$wallpaper_dir/archcraft-light.jpg"
+    fi
+    if [ "$SWAY_THEME" = pywal ] && ! command -v wal >/dev/null 2>&1; then
+        write_status dependency-required missing-pywal-command wal
+        return 67
+    fi
+
+    # Geany creates this file only after its first interactive launch, while
+    # Archcraft's offline theme script expects it to exist already.
+    mkdir -p "$TARGET_HOME/.config/geany"
+    if [ ! -e "$TARGET_HOME/.config/geany/geany.conf" ]; then
+        cat > "$TARGET_HOME/.config/geany/geany.conf" <<'EOF'
+[geany]
+color_scheme=
+EOF
+    fi
+
+    # Generate all official component color files before Sway starts. Commands
+    # that only notify/reload a live desktop are replaced in this bounded
+    # offline phase; the generated files are consumed when the session starts.
+    stub=$(mktemp -d /tmp/lindex-sway-theme-stub.XXXXXX)
+    for command_name in notify-send gsettings swaymsg makoctl; do
+        ln -s /bin/true "$stub/$command_name"
+    done
+    cat > "$stub/xdg-user-dir" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$HOME/Pictures"
+EOF
+    chmod 0755 "$stub/xdg-user-dir"
+    case "$SWAY_THEME" in
+        dark) theme_argument=--default ;;
+        light) theme_argument=--light ;;
+        pywal) theme_argument=--pywal ;;
+    esac
+    theme_rc=0
+    HOME="$TARGET_HOME" TMPDIR=/tmp TMP=/tmp TEMP=/tmp \
+        PATH="$stub:/usr/local/bin:/usr/bin:/bin" \
+        "$theme_script" "$theme_argument" || theme_rc=$?
+    rm -rf -- "$stub"
+    [ "$theme_rc" -eq 0 ] || {
+        write_status profile-unavailable archcraft-sway-theme-apply-failed "$SWAY_THEME:$theme_rc"
+        return 67
+    }
+    printf '%s\n' "$SWAY_THEME" > "$target/theme/.mode_state"
+    owner=$(stat -c '%u:%g' "$TARGET_HOME")
+    chown -R "$owner" "$target" "$TARGET_HOME/Pictures"
+    theme_marker=$STATE_ROOT/archcraft-sway-theme.ready
+    {
+        echo 'format=1'
+        echo "mode=$SWAY_THEME"
+        echo "source_commit=$SWAY_SOURCE_COMMIT"
+        echo "appearance_archive_sha256=$SWAY_APPEARANCE_SHA"
+    } > "$theme_marker.tmp.$$"
+    chmod 0644 "$theme_marker.tmp.$$"
+    mv -f "$theme_marker.tmp.$$" "$theme_marker"
+}
+
+case "$PROFILE" in
+    sway)
+        install_official_sway_profile || exit $?
+        apply_official_sway_theme || exit $?
+        ;;
+    lxqt|xfce) ;;
+esac
+
+ready=$(ready_path); tmp=$ready.tmp.$$
+{
+    echo 'format=2'
+    echo "profile=$PROFILE"
+    echo 'state=ready'
+    echo "detail=$(profile_detail)"
+    echo "appearance=$(profile_appearance)"
+    echo "composition_count=$(composition_manifest | sed '/^$/d' | wc -l | tr -d ' ')"
+    echo "requirements=$(profile_requirement)"
+    if [ "$PROFILE" = sway ]; then
+        echo "appearance_source_commit=$SWAY_SOURCE_COMMIT"
+        echo "appearance_archive_sha256=$SWAY_APPEARANCE_SHA"
+        echo "sway_theme=$SWAY_THEME"
+    fi
+    echo "debian_mappings=$(debian_mappings)"
+    echo 'missing_upstream_packages='
+    echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$tmp"
+chmod 0600 "$tmp"
+mv -f "$tmp" "$ready"
+write_status ready installed
+write_progress 98 profile-configuration profile-ready
+echo "LinDeX profile ready: $PROFILE"

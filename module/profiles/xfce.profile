@@ -1,0 +1,9 @@
+id=xfce
+name=XFCE + labwc
+family=wlroots-0.18
+compositor=labwc
+install=apt
+composition=labwc wlr-randr xorg-xwayland foot vkmark vulkan-tools mesa-utils xfce4 xfce4-terminal
+debian_mappings=xorg-xwayland:xwayland
+appearance=debian-stock
+status=stable

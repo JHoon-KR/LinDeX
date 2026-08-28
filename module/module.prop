@@ -1,0 +1,6 @@
+id=debian_chroot
+name=LinDeX
+version=v3.0.4-dev
+versionCode=304
+author=JHoon
+description=LinDeX unpatched Wayland profiles, automatic Mesa setup, DRM lease bridge, one-button WebUI, and no system overlay

@@ -1,0 +1,451 @@
+#!/bin/sh
+# LinDeX: internal installer for reproducible profile dependencies.
+# Maintainer: JHoon.
+# Android/system partitions are never mounted or modified by this program.
+# This file is staged under libexec and installs only the public Sway helpers
+# selected by the three-profile release.
+set -eu
+
+STATE_ROOT=${ANDROID_DRM_PROVIDER_STATE:-/var/lib/android-drm-lease-kit/providers}
+CACHE_ROOT=${ANDROID_DRM_PROVIDER_CACHE:-/var/cache/android-drm-lease-kit/providers}
+PREFIX_ROOT=${ANDROID_DRM_PROVIDER_PREFIX:-/opt/android-drm-providers}
+ACTION=
+PROVIDER=
+PROFILE=
+WORK=
+
+PASTEL_VERSION=0.12.0
+PASTEL_FILE=pastel-v0.12.0-aarch64-unknown-linux-gnu.tar.gz
+PASTEL_URL=https://github.com/sharkdp/pastel/releases/download/v0.12.0/$PASTEL_FILE
+PASTEL_SHA=f437e19974399ab7ae99fa52b76a2cdfad4fafafde3b48243100d371894935ba
+
+PYWAL_VERSION=3.8.15
+PYWAL_FILE=pywal16-$PYWAL_VERSION.tar.gz
+PYWAL_URL=https://files.pythonhosted.org/packages/5c/20/051723abec22086f7d808064a148568880878f251a6edeff0e46dfe785c7/$PYWAL_FILE
+PYWAL_SHA=aa01949f21e9a2a3d72305f19c5e366df81da9806ad3321da294d68b48d6ddd0
+
+usage() {
+    cat <<'EOF'
+usage:
+  profile-runtime-manager ensure --profile PROFILE
+  profile-runtime-manager install --provider PROVIDER
+  profile-runtime-manager status --provider PROVIDER
+  profile-runtime-manager classify
+
+PROFILE: sway
+PROVIDER: pastel | python-pywal
+EOF
+}
+
+die_usage() { usage >&2; exit 64; }
+
+ACTION=${1:-}
+case "$ACTION" in ensure|install|status|classify) shift ;; *) die_usage ;; esac
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --provider) [ "$#" -ge 2 ] || die_usage; PROVIDER=$2; shift 2 ;;
+        --profile) [ "$#" -ge 2 ] || die_usage; PROFILE=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die_usage ;;
+    esac
+done
+
+provider_valid() {
+    case "$1" in
+        pastel|python-pywal) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+profile_valid() {
+    case "$1" in sway) return 0 ;; *) return 1 ;; esac
+}
+
+case "$ACTION" in
+    ensure) profile_valid "$PROFILE" || die_usage ;;
+    install|status) provider_valid "$PROVIDER" || die_usage ;;
+esac
+
+cleanup() {
+    [ -z "$WORK" ] || rm -rf -- "$WORK"
+}
+trap cleanup EXIT HUP INT TERM
+
+provider_status_path() { printf '%s/%s.status\n' "$STATE_ROOT" "$1"; }
+provider_ready_path() { printf '%s/%s.ready\n' "$STATE_ROOT" "$1"; }
+
+write_status() {
+    provider=$1 state=$2 detail=$3 source_sha=${4:-}
+    mkdir -p "$STATE_ROOT"
+    path=$(provider_status_path "$provider")
+    tmp=$path.tmp.$$
+    {
+        echo 'format=1'
+        echo "provider=$provider"
+        echo "state=$state"
+        echo "detail=$detail"
+        echo "source_sha256=$source_sha"
+        echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$tmp"
+    chmod 0600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$path"
+    printf 'PROVIDER_STATUS provider=%s state=%s detail=%s\n' "$provider" "$state" "$detail"
+}
+
+write_ready() {
+    upstream=$1 provider=$2 revision=$3 source_sha=$4
+    mkdir -p "$STATE_ROOT"
+    path=$(provider_ready_path "$upstream")
+    tmp=$path.tmp.$$
+    {
+        echo "provider=$provider"
+        echo "upstream=$upstream"
+        echo 'state=ready'
+        echo "revision=$revision"
+        echo "source_sha256=$source_sha"
+        echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$tmp"
+    chmod 0600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$path"
+}
+
+provider_ready() {
+    path=$(provider_ready_path "$1")
+    [ -r "$path" ] && [ "$(sed -n 's/^state=//p' "$path")" = ready ]
+}
+
+ready_matches() {
+    upstream=$1 provider=$2 revision=$3 source_sha=$4
+    path=$(provider_ready_path "$upstream")
+    [ -r "$path" ] || return 1
+    [ "$(sed -n 's/^state=//p' "$path" | sed -n '1p')" = ready ] &&
+    [ "$(sed -n 's/^provider=//p' "$path" | sed -n '1p')" = "$provider" ] &&
+    [ "$(sed -n 's/^revision=//p' "$path" | sed -n '1p')" = "$revision" ] &&
+    [ "$(sed -n 's/^source_sha256=//p' "$path" | sed -n '1p')" = "$source_sha" ]
+}
+
+package_candidate() {
+    apt-cache policy "$1" 2>/dev/null | sed -n 's/^  Candidate: //p' | sed -n '1p'
+}
+
+classify() {
+    printf 'name|trixie_candidate|strategy\n'
+    for item in \
+        'pastel|pastel|verified-release-arm64' \
+        'python-pywal|python3-pywal|verified-source-copy'
+    do
+        name=${item%%|*}
+        rest=${item#*|}
+        package=${rest%%|*}
+        strategy=${rest#*|}
+        candidate=$(package_candidate "$package")
+        [ -n "$candidate" ] || candidate=none
+        printf '%s|%s|%s\n' "$name" "$candidate" "$strategy"
+    done
+}
+
+if [ "$ACTION" = classify ]; then
+    classify
+    exit 0
+fi
+
+show_status() {
+    path=$(provider_status_path "$PROVIDER")
+    if [ -r "$path" ]; then
+        cat "$path"
+    else
+        printf 'format=1\nprovider=%s\nstate=not-installed\ndetail=never-installed\n' "$PROVIDER"
+    fi
+}
+
+if [ "$ACTION" = status ]; then
+    show_status
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo 'root is required' >&2; exit 1; }
+[ "$(dpkg --print-architecture)" = arm64 ] || {
+    write_status "${PROVIDER:-$PROFILE}" unsupported-architecture arm64-required ''
+    exit 70
+}
+CODENAME=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | tr -d '"' | sed -n '1p')
+[ "$CODENAME" = trixie ] || {
+    write_status "${PROVIDER:-$PROFILE}" unsupported-distribution trixie-required ''
+    exit 70
+}
+[ "$PREFIX_ROOT" = /opt/android-drm-providers ] || case "$PREFIX_ROOT" in /opt/android-drm-providers/*) ;; *) echo 'unsafe provider prefix' >&2; exit 70 ;; esac
+
+mkdir -p "$STATE_ROOT/transactions" "$CACHE_ROOT/downloads" "$PREFIX_ROOT" /usr/local/bin
+
+sha_valid() { printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{64}$'; }
+
+APT_UPDATED=no
+apt_update_once() {
+    [ "$APT_UPDATED" = yes ] && return 0
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update || return 1
+    APT_UPDATED=yes
+}
+
+ensure_runtime_tools() {
+    requested=$1
+    packages=
+    need_python=no
+    need_curl=no
+    for item in $requested; do
+        case "$item" in
+            pastel|python-pywal) need_python=yes; need_curl=yes ;;
+        esac
+    done
+    if [ "$need_python" = yes ] && ! command -v python3 >/dev/null 2>&1; then
+        packages="$packages python3"
+    fi
+    if [ "$need_curl" = yes ] && ! command -v curl >/dev/null 2>&1; then
+        packages="$packages ca-certificates curl"
+    fi
+    [ -z "$packages" ] && return 0
+    apt_update_once || return 68
+    # packages is a fixed list assembled only from the cases above.
+    # shellcheck disable=SC2086
+    apt-get install -y --no-install-recommends $packages || return 68
+}
+
+fetch_checked() {
+    file=$1 url=$2 sha=$3
+    path=$CACHE_ROOT/downloads/$file
+    if [ ! -f "$path" ]; then
+        command -v curl >/dev/null 2>&1 || {
+            write_status "$PROVIDER" dependency-required curl "$sha"
+            exit 67
+        }
+        if ! curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$path.part" "$url"; then
+            write_status "$PROVIDER" download-failed "$file" "$sha"
+            exit 68
+        fi
+        mv -f "$path.part" "$path"
+    fi
+    if ! printf '%s  %s\n' "$sha" "$path" | sha256sum -c - >/dev/null 2>&1; then
+        mv -f "$path" "$path.rejected.$(date -u +%Y%m%dT%H%M%SZ)"
+        write_status "$PROVIDER" checksum-failed "$file" "$sha"
+        exit 66
+    fi
+    printf '%s\n' "$path"
+}
+
+safe_extract() {
+    archive=$1 destination=$2
+    python3 - "$archive" "$destination" <<'PY'
+import os
+import pathlib
+import sys
+import tarfile
+
+archive, destination = sys.argv[1:3]
+max_members = 50000
+max_total = 1024 * 1024 * 1024
+max_file = 256 * 1024 * 1024
+
+def clean(value, base=pathlib.PurePosixPath(".")):
+    if not value or value.startswith("/") or "\\" in value:
+        raise ValueError(f"unsafe path: {value!r}")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("control character in path")
+    parts = []
+    for part in base.joinpath(pathlib.PurePosixPath(value)).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise ValueError(f"path escapes root: {value!r}")
+            parts.pop()
+        else:
+            parts.append(part)
+    if not parts:
+        raise ValueError(f"empty path: {value!r}")
+    return pathlib.PurePosixPath(*parts)
+
+with tarfile.open(archive, "r:*") as bundle:
+    members = bundle.getmembers()
+    if len(members) > max_members:
+        raise ValueError("member limit exceeded")
+    total = 0
+    for member in members:
+        if member.isdir() and member.name in (".", "./"):
+            continue
+        path = clean(member.name)
+        if member.isdev() or member.isfifo():
+            raise ValueError(f"special file forbidden: {member.name!r}")
+        if member.isfile():
+            if member.size < 0 or member.size > max_file:
+                raise ValueError(f"member too large: {member.name!r}")
+            total += member.size
+            if total > max_total:
+                raise ValueError("expanded size limit exceeded")
+        if member.issym():
+            clean(member.linkname, path.parent)
+        elif member.islnk():
+            clean(member.linkname)
+    data_filter = getattr(tarfile, "data_filter", None)
+    if data_filter is None:
+        raise RuntimeError("Python tarfile data_filter is required")
+    bundle.extractall(destination, filter=data_filter)
+PY
+}
+
+wrapper_allowed() {
+    path=$1
+    [ ! -e "$path" ] && [ ! -L "$path" ] && return 0
+    [ -f "$path" ] && grep -q '^# android-drm-provider-manager:' "$path" 2>/dev/null
+}
+
+wrapper_owned() {
+    command_name=$1 owner=$2
+    path=/usr/local/bin/$command_name
+    [ -x "$path" ] && grep -q "^# android-drm-provider-manager:$owner\$" "$path" 2>/dev/null
+}
+
+install_binary_wrapper() {
+    command_name=$1 prefix=$2 relative=$3 owner=$4
+    path=/usr/local/bin/$command_name
+    wrapper_allowed "$path" || {
+        write_status "$owner" conflict "unowned-$path" ''
+        return 69
+    }
+    tmp=$path.tmp.$$
+    {
+        echo "#!/bin/sh"
+        echo "# android-drm-provider-manager:$owner"
+        echo "prefix='$prefix'"
+        echo 'export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+        echo 'export PYTHONPATH="$prefix/lib/python${PYTHONPATH:+:$PYTHONPATH}"'
+        echo "exec \"\$prefix/$relative\" \"\$@\""
+    } > "$tmp"
+    chmod 0755 "$tmp"
+    mv -f "$tmp" "$path"
+}
+
+install_python_wrapper() {
+    command_name=$1 prefix=$2 module=$3 owner=$4
+    path=/usr/local/bin/$command_name
+    wrapper_allowed "$path" || {
+        write_status "$owner" conflict "unowned-$path" ''
+        return 69
+    }
+    tmp=$path.tmp.$$
+    {
+        echo '#!/bin/sh'
+        echo "# android-drm-provider-manager:$owner"
+        echo "prefix='$prefix'"
+        echo 'export PYTHONPATH="$prefix/lib/python${PYTHONPATH:+:$PYTHONPATH}"'
+        echo "exec python3 -m $module \"\$@\""
+    } > "$tmp"
+    chmod 0755 "$tmp"
+    mv -f "$tmp" "$path"
+}
+
+replace_prefix() {
+    source_dir=$1 destination=$2 owner=$3
+    [ ! -L "$destination" ] || {
+        write_status "$owner" conflict symlink-prefix ''
+        return 69
+    }
+    stage=$(mktemp -d "$PREFIX_ROOT/.stage-$owner.XXXXXX")
+    cp -a "$source_dir/." "$stage/"
+    if [ -e "$destination" ]; then
+        backup=$STATE_ROOT/transactions/$(date -u +%Y%m%dT%H%M%SZ)-$owner
+        mkdir -p "$backup"
+        mv "$destination" "$backup/previous-prefix"
+    fi
+    mv "$stage" "$destination"
+}
+
+install_pastel() {
+    PROVIDER=pastel
+    prefix=$PREFIX_ROOT/pastel-$PASTEL_VERSION
+    if ready_matches pastel pastel "v$PASTEL_VERSION" "$PASTEL_SHA" &&
+       wrapper_owned pastel pastel && /usr/local/bin/pastel --version >/dev/null 2>&1; then
+        write_status pastel ready "v$PASTEL_VERSION" "$PASTEL_SHA"
+        return 0
+    fi
+    archive=$(fetch_checked "$PASTEL_FILE" "$PASTEL_URL" "$PASTEL_SHA")
+    WORK=$(mktemp -d /tmp/android-drm-provider.XXXXXX)
+    mkdir -p "$WORK/extract"
+    safe_extract "$archive" "$WORK/extract" || { write_status pastel invalid-archive safe-extract "$PASTEL_SHA"; return 66; }
+    source_dir=$WORK/extract/pastel-v$PASTEL_VERSION-aarch64-unknown-linux-gnu
+    [ -x "$source_dir/pastel" ] || { write_status pastel invalid-archive binary-missing "$PASTEL_SHA"; return 66; }
+    stage=$WORK/prefix
+    mkdir -p "$stage/bin" "$stage/share/man/man1" "$stage/share/licenses/pastel"
+    cp "$source_dir/pastel" "$stage/bin/pastel"
+    chmod 0755 "$stage/bin/pastel"
+    cp -a "$source_dir/man/." "$stage/share/man/man1/"
+    cp "$source_dir/LICENSE-MIT" "$source_dir/LICENSE-APACHE" "$stage/share/licenses/pastel/"
+    replace_prefix "$stage" "$prefix" pastel || return $?
+    install_binary_wrapper pastel "$prefix" bin/pastel pastel || return $?
+    /usr/local/bin/pastel --version >/dev/null 2>&1 || { write_status pastel verification-failed version "$PASTEL_SHA"; return 68; }
+    write_ready pastel pastel "v$PASTEL_VERSION" "$PASTEL_SHA"
+    write_status pastel ready "v$PASTEL_VERSION" "$PASTEL_SHA"
+    rm -rf -- "$WORK"; WORK=
+}
+
+install_pywal() {
+    PROVIDER=python-pywal
+    prefix=$PREFIX_ROOT/pywal16-$PYWAL_VERSION
+    if ready_matches python-pywal python-pywal "pywal16-$PYWAL_VERSION" "$PYWAL_SHA" &&
+       wrapper_owned wal python-pywal &&
+       PYTHONPATH="$prefix/lib/python" python3 -c 'import pywal' >/dev/null 2>&1; then
+        write_status python-pywal ready "pywal16-$PYWAL_VERSION" "$PYWAL_SHA"
+        return 0
+    fi
+    archive=$(fetch_checked "$PYWAL_FILE" "$PYWAL_URL" "$PYWAL_SHA")
+    WORK=$(mktemp -d /tmp/android-drm-provider.XXXXXX)
+    mkdir -p "$WORK/extract"
+    safe_extract "$archive" "$WORK/extract" || { write_status python-pywal invalid-archive safe-extract "$PYWAL_SHA"; return 66; }
+    source_dir=$WORK/extract/pywal16-$PYWAL_VERSION
+    [ -f "$source_dir/pywal/__main__.py" ] || { write_status python-pywal invalid-archive module-missing "$PYWAL_SHA"; return 66; }
+    stage=$WORK/prefix
+    mkdir -p "$stage/lib/python" "$stage/share/licenses/pywal16" "$stage/share/man/man1"
+    cp -a "$source_dir/pywal" "$stage/lib/python/"
+    cp "$source_dir/LICENSE.md" "$stage/share/licenses/pywal16/"
+    cp "$source_dir/data/man/man1/wal.1" "$stage/share/man/man1/"
+    replace_prefix "$stage" "$prefix" python-pywal || return $?
+    install_python_wrapper wal "$prefix" pywal python-pywal || return $?
+    PYTHONPATH="$prefix/lib/python" python3 -c 'import pywal' >/dev/null 2>&1 || {
+        write_status python-pywal verification-failed import "$PYWAL_SHA"; return 68;
+    }
+    write_ready python-pywal python-pywal "pywal16-$PYWAL_VERSION" "$PYWAL_SHA"
+    write_status python-pywal ready "pywal16-$PYWAL_VERSION" "$PYWAL_SHA"
+    rm -rf -- "$WORK"; WORK=
+}
+
+install_provider() {
+    provider=$1
+    case "$provider" in
+        pastel) install_pastel ;;
+        python-pywal) install_pywal ;;
+    esac
+}
+
+providers_for_profile() {
+    case "$1" in
+        sway) printf '%s\n' 'pastel python-pywal' ;;
+    esac
+}
+
+if [ "$ACTION" = install ]; then
+    if ! ensure_runtime_tools "$PROVIDER"; then
+        write_status "$PROVIDER" dependency-required debian-runtime-tools ''
+        exit 67
+    fi
+    install_provider "$PROVIDER"
+    exit $?
+fi
+
+PROVIDERS=$(providers_for_profile "$PROFILE")
+if ! ensure_runtime_tools "$PROVIDERS"; then
+    write_status "$PROFILE" dependency-required debian-runtime-tools ''
+    exit 67
+fi
+for item in $PROVIDERS; do
+    install_provider "$item" || exit $?
+done
+write_status "$PROFILE" ready all-profile-providers ''

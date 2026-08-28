@@ -1,0 +1,42 @@
+#!/bin/sh
+# Scope LinDeX Firefox adapters to Firefox instead of the Wayland compositor.
+set -eu
+
+codec_root=/opt/android-drm-lease-kit/codec
+egl_adapter=$codec_root/liblindex-firefox-egl-drm-identity.so
+rdd_adapter=$codec_root/liblindex-firefox-advc-rdd-socket.so
+expected_preload=$egl_adapter:$rdd_adapter
+
+case "${0##*/}" in
+    firefox|firefox-esr|lindex-firefox)
+        firefox_binary=/usr/bin/firefox-esr
+        [ -x "$firefox_binary" ] || firefox_binary=/usr/bin/firefox
+        ;;
+    *)
+        echo 'LinDeX Firefox launcher has an invalid invocation name' >&2
+        exit 126
+        ;;
+esac
+
+[ -x "$firefox_binary" ] || {
+    echo 'Firefox is not installed' >&2
+    exit 127
+}
+
+# Accept only the immutable, session-verified pair exported by LinDeX. Never
+# append a caller-provided preload or compositor/lease FD environment.
+if [ "${LINDEX_FIREFOX_PRELOAD:-}" = "$expected_preload" ] &&
+   [ -f "$egl_adapter" ] && [ ! -L "$egl_adapter" ] &&
+   [ -f "$rdd_adapter" ] && [ ! -L "$rdd_adapter" ]; then
+    export LD_PRELOAD=$expected_preload
+else
+    unset LD_PRELOAD
+fi
+unset DRM_LEASE_FD DRM_LEASE_LESSEE_ID DRM_LEASE_OBJECTS
+unset LIBSEAT_BACKEND SEATD_VTBOUND WLR_BACKENDS WLR_DRM_DEVICES
+unset WLR_RENDER_DRM_DEVICE WLR_RENDERER WLR_RENDERER_ALLOW_SOFTWARE
+unset VK_LAYER_PATH VK_INSTANCE_LAYERS
+unset ANDROID_VULKAN_DRM_IDENTITY_ENABLE ANDROID_VULKAN_DRM_IDENTITY_ACK
+unset ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID ANDROID_VULKAN_DRM_IDENTITY_TRACE
+
+exec "$firefox_binary" "$@"

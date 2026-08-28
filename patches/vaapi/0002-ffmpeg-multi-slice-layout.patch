@@ -1,0 +1,346 @@
+From: JHoon <maintainer@lindex.invalid>
+Subject: [PATCH 2/2] vaapi: preserve FFmpeg multi-slice data layout
+
+FFmpeg submits slice buffers as alternating parameter/data pairs.  The decode
+runtime previously accepted only one VASliceDataBuffer per picture, so the
+second slice failed before EndPicture.  Append each local data buffer, rebase
+its buffer-relative offsets into the aggregate access unit, and reject
+ambiguous order, incomplete bindings, overflow, and out-of-range spans.
+
+---
+ src/vaapi_advc/CMakeLists.txt                 | 18 ++++-
+ src/vaapi_advc/advc_vaapi_decode_runtime.c    | 89 +++++++++++++++++++---
+ src/vaapi_advc/advc_vaapi_slice_layout.c      | 34 +++++++++
+ src/vaapi_advc/advc_vaapi_slice_layout.h      | 28 +++++++
+ src/vaapi_advc/tests/slice_layout_test.c      | 59 +++++++++++++++
+ 5 files changed, 215 insertions(+), 13 deletions(-)
+
+diff --git a/src/vaapi_advc/advc_vaapi_slice_layout.h b/src/vaapi_advc/advc_vaapi_slice_layout.h
+new file mode 100644
+--- /dev/null
++++ b/src/vaapi_advc/advc_vaapi_slice_layout.h
+@@ -0,0 +1,28 @@
++#ifndef ADVC_VAAPI_SLICE_LAYOUT_H
++#define ADVC_VAAPI_SLICE_LAYOUT_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Rebase offsets which are relative to one VASliceDataBuffer onto an
++ * aggregate access-unit buffer.  Validation is transactional: no offset is
++ * changed unless every span is contained in the local data buffer and the
++ * aggregate size is representable by libva's 32-bit slice_data_offset.
++ */
++int advc_vaapi_rebase_slice_offsets(uint32_t *offsets,
++                                    const uint32_t *sizes,
++                                    size_t span_count,
++                                    size_t aggregate_size,
++                                    size_t local_data_size,
++                                    size_t maximum_size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/vaapi_advc/advc_vaapi_slice_layout.c b/src/vaapi_advc/advc_vaapi_slice_layout.c
+new file mode 100644
+--- /dev/null
++++ b/src/vaapi_advc/advc_vaapi_slice_layout.c
+@@ -0,0 +1,34 @@
++#include "advc_vaapi_slice_layout.h"
++
++#include <errno.h>
++#include <limits.h>
++
++int advc_vaapi_rebase_slice_offsets(uint32_t *offsets,
++                                    const uint32_t *sizes,
++                                    size_t span_count,
++                                    size_t aggregate_size,
++                                    size_t local_data_size,
++                                    size_t maximum_size) {
++    size_t i;
++
++    if (offsets == NULL || sizes == NULL || span_count == 0 ||
++        local_data_size == 0 || aggregate_size > maximum_size ||
++        local_data_size > maximum_size - aggregate_size ||
++        aggregate_size + local_data_size > UINT32_MAX) {
++        errno = EINVAL;
++        return -1;
++    }
++    for (i = 0; i < span_count; ++i) {
++        size_t offset = offsets[i];
++        size_t size = sizes[i];
++        if (offset > local_data_size || size == 0 ||
++            size > local_data_size - offset ||
++            aggregate_size + offset > UINT32_MAX) {
++            errno = EINVAL;
++            return -1;
++        }
++    }
++    for (i = 0; i < span_count; ++i)
++        offsets[i] = (uint32_t)(aggregate_size + offsets[i]);
++    return 0;
++}
+diff --git a/src/vaapi_advc/tests/slice_layout_test.c b/src/vaapi_advc/tests/slice_layout_test.c
+new file mode 100644
+--- /dev/null
++++ b/src/vaapi_advc/tests/slice_layout_test.c
+@@ -0,0 +1,59 @@
++#include "advc_vaapi_slice_layout.h"
++
++#include <assert.h>
++#include <errno.h>
++#include <stdint.h>
++
++static void test_ffmpeg_pair_rebase(void) {
++    uint32_t first_offset[] = {0};
++    const uint32_t first_size[] = {5};
++    uint32_t second_offset[] = {0};
++    const uint32_t second_size[] = {7};
++
++    assert(advc_vaapi_rebase_slice_offsets(first_offset, first_size, 1, 0, 5,
++                                           1024) == 0);
++    assert(first_offset[0] == 0);
++    assert(advc_vaapi_rebase_slice_offsets(second_offset, second_size, 1, 5,
++                                           7, 1024) == 0);
++    assert(second_offset[0] == 5);
++}
++
++static void test_many_parameters_one_data_buffer(void) {
++    uint32_t offsets[] = {1, 6};
++    const uint32_t sizes[] = {4, 3};
++
++    assert(advc_vaapi_rebase_slice_offsets(offsets, sizes, 2, 20, 9, 1024) ==
++           0);
++    assert(offsets[0] == 21);
++    assert(offsets[1] == 26);
++}
++
++static void test_failure_is_transactional(void) {
++    uint32_t offsets[] = {0, 8};
++    const uint32_t sizes[] = {4, 3};
++
++    errno = 0;
++    assert(advc_vaapi_rebase_slice_offsets(offsets, sizes, 2, 10, 9, 1024) ==
++           -1);
++    assert(errno == EINVAL);
++    assert(offsets[0] == 0);
++    assert(offsets[1] == 8);
++}
++
++static void test_aggregate_limit(void) {
++    uint32_t offset[] = {0};
++    const uint32_t size[] = {2};
++
++    errno = 0;
++    assert(advc_vaapi_rebase_slice_offsets(offset, size, 1, 9, 2, 10) == -1);
++    assert(errno == EINVAL);
++    assert(offset[0] == 0);
++}
++
++int main(void) {
++    test_ffmpeg_pair_rebase();
++    test_many_parameters_one_data_buffer();
++    test_failure_is_transactional();
++    test_aggregate_limit();
++    return 0;
++}
+diff --git a/src/vaapi_advc/CMakeLists.txt b/src/vaapi_advc/CMakeLists.txt
+--- a/src/vaapi_advc/CMakeLists.txt
++++ b/src/vaapi_advc/CMakeLists.txt
+@@ -38,5 +38,13 @@ target_compile_options(advc_h264_annexb PRIVATE
+     -Wall -Wextra -Wpedantic -Werror)
+ 
++add_library(advc_vaapi_slice_layout STATIC advc_vaapi_slice_layout.c)
++set_target_properties(advc_vaapi_slice_layout PROPERTIES
++    POSITION_INDEPENDENT_CODE ON)
++target_include_directories(advc_vaapi_slice_layout PUBLIC
++    "${CMAKE_CURRENT_SOURCE_DIR}")
++target_compile_options(advc_vaapi_slice_layout PRIVATE
++    -Wall -Wextra -Wpedantic -Werror)
++
+ add_library(advc_vaapi_surface_policy STATIC advc_vaapi_surface_policy.c)
+ set_target_properties(advc_vaapi_surface_policy PROPERTIES
+     POSITION_INDEPENDENT_CODE ON)
+@@ -61,6 +69,13 @@ target_compile_options(advc_h264_annexb_test PRIVATE
+     -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
+ add_test(NAME advc_h264_annexb COMMAND advc_h264_annexb_test)
+ 
++add_executable(advc_vaapi_slice_layout_test tests/slice_layout_test.c)
++target_link_libraries(advc_vaapi_slice_layout_test PRIVATE
++    advc_vaapi_slice_layout)
++target_compile_options(advc_vaapi_slice_layout_test PRIVATE
++    -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
++add_test(NAME advc_vaapi_slice_layout COMMAND advc_vaapi_slice_layout_test)
++
+ add_executable(advc_vaapi_surface_policy_test tests/surface_policy_test.c)
+ target_link_libraries(advc_vaapi_surface_policy_test PRIVATE
+     advc_vaapi_surface_policy)
+@@ -216,6 +231,7 @@ if(ADVC_BUILD_VAAPI_DRIVER)
+     target_link_libraries(advc_drv_video PRIVATE
+         advc_vaapi_policy advc_h264_annexb advc_vaapi_decode_hevc
+-        advc_vaapi_decode_vp9 advc_vaapi_surface_policy advc_vaapi_decode_eos
++        advc_vaapi_decode_vp9 advc_vaapi_slice_layout
++        advc_vaapi_surface_policy advc_vaapi_decode_eos
+         advc_vaapi_encode_runtime advc_vaapi_image advc_vaapi_encode
+         advc_protocol_for_vaapi
+         Threads::Threads Vulkan::Vulkan)
+diff --git a/src/vaapi_advc/advc_vaapi_decode_runtime.c b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+--- a/src/vaapi_advc/advc_vaapi_decode_runtime.c
++++ b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+@@ -6,7 +6,8 @@
+ #include "advc_h264_annexb.h"
+ #include "advc_vaapi_decode_eos.h"
+ #include "advc_vaapi_decode_hevc.h"
+ #include "advc_vaapi_decode_vp9.h"
++#include "advc_vaapi_slice_layout.h"
+ #include "advc_vaapi_surface_policy.h"
+ #include "advc/client.h"
+ 
+@@ -103,6 +104,7 @@ struct advc_vaapi_context {
+     VADecPictureParameterBufferVP9 vp9_picture;
+     VASliceParameterBufferVP9 *vp9_slice_parameters;
+     size_t slice_count;
++    size_t slice_data_bound_count;
+     uint8_t *slice_data;
+     size_t slice_data_size;
+     struct advc_h264_codec_config last_config;
+@@ -210,6 +212,7 @@ static void reset_staging(struct advc_vaapi_context *context) {
+     free(context->vp9_slice_parameters);
+     context->vp9_slice_parameters = NULL;
+     context->slice_count = 0;
++    context->slice_data_bound_count = 0;
+     free(context->slice_data);
+     context->slice_data = NULL;
+     context->slice_data_size = 0;
+@@ -605,7 +608,13 @@ static int append_slice_parameters(struct advc_vaapi_context *context,
+         expected_size = sizeof(VASliceParameterBufferH264);
+         max_slices = ADVC_H264_MAX_SLICES;
+     }
+-    if (buffer->element_size != expected_size ||
++    /*
++     * A parameter group must be followed by its data buffer.  Accepting a
++     * second group first would lose the libva buffer-relative offset domain
++     * and could associate slices with the wrong bytes.
++     */
++    if (context->slice_data_bound_count != context->slice_count ||
++        buffer->element_size != expected_size ||
+         buffer->num_elements == 0 || buffer->num_elements > max_slices ||
+         context->slice_count > max_slices - buffer->num_elements) {
+         errno = EINVAL;
+@@ -658,16 +667,69 @@ static int set_slice_data(struct advc_vaapi_context *context,
+                           const struct advc_vaapi_buffer *buffer) {
+     size_t size = (size_t)buffer->element_size * buffer->num_elements;
+-    uint8_t *copy;
+-    if (context->slice_data != NULL || size == 0 ||
+-        size > ADVC_MAX_INPUT_BYTES) {
++    size_t pending_count;
++    size_t i;
++    uint32_t *offsets;
++    uint32_t *sizes;
++    uint8_t *grown;
++    if (context->slice_data_bound_count >= context->slice_count || size == 0 ||
++        context->slice_data_size > ADVC_MAX_INPUT_BYTES ||
++        size > ADVC_MAX_INPUT_BYTES - context->slice_data_size) {
+         errno = EINVAL;
+         return -1;
+     }
+-    copy = malloc(size);
+-    if (copy == NULL) return -1;
+-    memcpy(copy, buffer->data, size);
+-    context->slice_data = copy;
+-    context->slice_data_size = size;
++    pending_count = context->slice_count - context->slice_data_bound_count;
++    offsets = calloc(pending_count, sizeof(*offsets));
++    sizes = calloc(pending_count, sizeof(*sizes));
++    if (offsets == NULL || sizes == NULL) {
++        free(offsets);
++        free(sizes);
++        return -1;
++    }
++    for (i = 0; i < pending_count; ++i) {
++        size_t index = context->slice_data_bound_count + i;
++        if (context->codec == ADVC_DECODE_CODEC_HEVC) {
++            offsets[i] = context->hevc_slice_parameters[index]
++                             .slice_data_offset;
++            sizes[i] = context->hevc_slice_parameters[index].slice_data_size;
++        } else if (context->codec == ADVC_DECODE_CODEC_VP9) {
++            offsets[i] = context->vp9_slice_parameters[index]
++                             .slice_data_offset;
++            sizes[i] = context->vp9_slice_parameters[index].slice_data_size;
++        } else {
++            offsets[i] = context->slice_parameters[index].slice_data_offset;
++            sizes[i] = context->slice_parameters[index].slice_data_size;
++        }
++    }
++    if (advc_vaapi_rebase_slice_offsets(
++            offsets, sizes, pending_count, context->slice_data_size, size,
++            ADVC_MAX_INPUT_BYTES) < 0) {
++        free(offsets);
++        free(sizes);
++        return -1;
++    }
++    grown = realloc(context->slice_data, context->slice_data_size + size);
++    if (grown == NULL) {
++        free(offsets);
++        free(sizes);
++        return -1;
++    }
++    memcpy(grown + context->slice_data_size, buffer->data, size);
++    context->slice_data = grown;
++    for (i = 0; i < pending_count; ++i) {
++        size_t index = context->slice_data_bound_count + i;
++        if (context->codec == ADVC_DECODE_CODEC_HEVC)
++            context->hevc_slice_parameters[index].slice_data_offset =
++                offsets[i];
++        else if (context->codec == ADVC_DECODE_CODEC_VP9)
++            context->vp9_slice_parameters[index].slice_data_offset =
++                offsets[i];
++        else
++            context->slice_parameters[index].slice_data_offset = offsets[i];
++    }
++    context->slice_data_size += size;
++    context->slice_data_bound_count = context->slice_count;
++    free(offsets);
++    free(sizes);
+     return 0;
+ }
+ 
+@@ -1450,7 +1512,8 @@ static VAStatus end_hevc_picture_locked(
+     VAStatus result = VA_STATUS_ERROR_DECODING_ERROR;
+     size_t i;
+     if (surface == NULL || !context->have_picture ||
+-        context->slice_count == 0 || context->slice_data == NULL) {
++        context->slice_count == 0 || context->slice_data == NULL ||
++        context->slice_data_bound_count != context->slice_count) {
+         trace_decode_failure("hevc-incomplete-picture", EINVAL);
+         goto out;
+     }
+@@ -1551,7 +1614,8 @@ static VAStatus end_vp9_picture_locked(
+     int key_frame = 0;
+     VAStatus result = VA_STATUS_ERROR_DECODING_ERROR;
+     if (surface == NULL || !context->have_picture ||
+-        context->slice_count != 1 || context->slice_data == NULL) {
++        context->slice_count != 1 || context->slice_data == NULL ||
++        context->slice_data_bound_count != context->slice_count) {
+         trace_decode_failure("vp9-incomplete-picture", EINVAL);
+         goto out;
+     }
+@@ -1622,7 +1686,8 @@ VAStatus advc_vaapi_decode_end_picture(
+     surface = get_surface(runtime, context->target);
+     config = get_config(runtime, context->config_id);
+     if (surface == NULL || config == NULL || !context->have_picture ||
+-        context->slice_count == 0 || context->slice_data == NULL) {
++        context->slice_count == 0 || context->slice_data == NULL ||
++        context->slice_data_bound_count != context->slice_count) {
+         trace_decode_failure("incomplete-picture", EINVAL);
+         goto out;
+     }
+-- 
+2.47.1

@@ -1,0 +1,90 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-module-webui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdrm-dev libva-dev libvulkan-dev cmake ninja-build dash
+
+      - name: Check WebUI JavaScript
+        run: |
+          node --check module/webroot/app.js
+          node --check module/webroot/locales.js
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            first=$(head -n 1 "$file" || true)
+            case "$first" in
+              *bash*) bash -n "$file" ;;
+              '#!'*) dash -n "$file" ;;
+            esac
+          done < <(find module scripts -type f -print0)
+
+      - name: Build the unpatched DRM bridge
+        run: |
+          OUT=build/bridge-host EXPECTED_ARCH=x86_64 \
+            sh ./scripts/build-bridge-runtime.sh
+          sh ./scripts/test-vulkan-drm-identity.sh
+
+      - name: Build and test the video bridge
+        run: |
+          cmake -S src/video_bridge -B build/video-host -G Ninja
+          cmake --build build/video-host
+          ctest --test-dir build/video-host --output-on-failure
+
+      - name: Build and test the VA-API bridge
+        run: |
+          cmake -S src/vaapi_advc -B build/vaapi-host -G Ninja
+          cmake --build build/vaapi-host
+          ctest --test-dir build/vaapi-host --output-on-failure
+
+      - name: Verify checked-in runtime artifacts
+        run: |
+          (cd module && sha256sum -c advc-artifacts.sha256)
+          (cd module/payload/bridge && sha256sum -c BRIDGE_PAYLOAD.sha256)
+
+      - name: Run v3 integration fixtures
+        run: |
+          set -e
+          for test in \
+            test-profile-manifests.sh \
+            test-profile-provider-manager.sh \
+            test-neofetch-hardware-identity.sh \
+            test-webui-quick-start.sh \
+            test-video-acceleration-module.sh \
+            test-video-application-matrix.sh \
+            test-gstreamer-h264-decode-diagnostic.sh \
+            test-video-encode-surface.sh \
+            test-display-link-recovery.sh \
+            test-session-runner-display-restore.sh \
+            test-drm-lease-broker-auto.sh \
+            test-advc-broker-rollover.sh \
+            test-android-drm-bridge.sh \
+            test-android-drm-bridge-probe.sh \
+            test-android-drm-bridge-fb-cleanup.sh; do
+            bash "./scripts/$test"
+          done
+
+      - name: Enforce public release boundaries
+        run: |
+          test ! -e module/system
+          ! find module -type f | grep -E '/(gnome|mutter|kwin|plasma)(/|$)'
+          ! find module -type f | grep -E 'build-stock-wlroots|stock-wlroots.*smoke'
+          ! grep -E 'river-stack|newm-next-stack|zig-0\.16' \
+            module/payload/debian/android-drm-provider-manager
+          grep -q '^name=LinDeX$' module/module.prop
+          grep -q '^author=JHoon$' module/module.prop
+          grep -q 'Copyright (c) 2026 av2xn' LICENSE

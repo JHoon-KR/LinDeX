@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+STATE=/var/lib/android-drm-lease-kit
+
+[ "$(id -u)" -eq 0 ] || { echo "root is required" >&2; exit 1; }
+[ -d "$STATE/transactions" ] || { echo "no Mesa overlay transactions"; exit 0; }
+
+find "$STATE/transactions" -mindepth 1 -maxdepth 1 -type d | sort -r | while IFS= read -r txn; do
+    echo "Rolling back $txn"
+    if [ -s "$txn/new.list" ]; then
+        while IFS= read -r path; do
+            [ -d "/$path" ] && continue
+            rm -f -- "/$path"
+        done < "$txn/new.list"
+    fi
+    [ -f "$txn/backup.tar.gz" ] && tar -xzf "$txn/backup.tar.gz" -C /
+    mv "$txn" "$txn.rolled-back"
+done
+ldconfig
+rm -f "$STATE/installed" "$STATE/install.conf"
+echo "Mesa overlay files rolled back. Debian apt packages were intentionally retained."
+

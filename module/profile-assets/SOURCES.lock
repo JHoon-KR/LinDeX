@@ -1,0 +1,11 @@
+profile=archcraft-sway-free
+source=https://github.com/archcraft-os/archcraft-sway
+commit=e4d0126d7f236fee50a84fbb0e61498dcf5705e7
+archive=archcraft-sway-free-e4d0126d.tar.gz
+archive_sha256=da89184c13bb68affc89b2638efb2d93736dc685e4104f6a5a497c6f9e43dadc
+license=GPL-3.0
+contents=complete-git-archive
+
+appearance_archive=lindex-archcraft-sway-public-assets-v2.tar.gz
+appearance_archive_sha256=4b84564c692e270bb46bbc36c4e5f9b1684c5ed4f1d8bcbf053698780a0af08c
+appearance_sources=APPEARANCE_SOURCES.lock

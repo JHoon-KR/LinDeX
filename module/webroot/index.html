@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>LinDeX</title>
+  <link rel="stylesheet" href="style.css?v=308">
+  <style>.install-progress{margin:12px 0;padding:12px;border:1px solid #315f98;border-radius:11px;background:#0c1726}.install-progress>div{display:flex;justify-content:space-between;gap:12px;color:#94a4ba;font-size:12px}.install-progress progress{width:100%;height:10px;margin-top:9px;accent-color:#69a8ff}.install-progress p{margin:7px 0 0}.primary[aria-disabled=true]{background:#33465f;color:#a9b5c5;cursor:not-allowed}</style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><p class="eyebrow">ADRENO · STOCK WAYLAND · DRM LEASE</p><h1 data-i18n="title">LinDeX</h1></div>
+      <div class="header-actions"><select id="language"><option value="ko">한국어</option><option value="en">English</option></select><span id="flavor" class="pill">—</span></div>
+    </header>
+
+    <section class="status-grid">
+      <article><span data-i18n="hardware">GPU 장치</span><strong id="hardware">—</strong></article>
+      <article><span data-i18n="display">외부 모니터</span><strong id="display">—</strong></article>
+      <article><span data-i18n="session">Debian 세션</span><strong id="session">—</strong></article>
+      <article><span data-i18n="preparation">설치 상태</span><strong id="preparation">—</strong></article>
+    </section>
+
+    <section class="panel start-panel">
+      <h2 data-i18n="quickStart">간편 시작</h2>
+      <p data-i18n="quickStartHelp">선택한 프로필의 누락 패키지, 오픈소스 런타임과 Mesa를 자동으로 준비한 뒤 시작합니다.</p>
+      <label><span data-i18n="profile">프로필</span><select id="profile">
+        <option value="sway" data-i18n="profileSway">Archcraft Sway Free · 공식 공개 dotfiles</option>
+        <option value="lxqt" data-i18n="profileLxqt">LXQt + stock labwc</option>
+        <option value="xfce" data-i18n="profileXfce">XFCE + stock labwc</option>
+      </select></label>
+      <p id="profileHelp" class="hint"></p>
+      <label id="swayThemeSetting"><span><b data-i18n="swayTheme">Sway 테마</b><small data-i18n="swayThemeHelp">공식 Dark/Light 또는 번들·사용자 월페이퍼 기반 Pywal 색상을 적용합니다.</small></span><select id="swayTheme"><option value="dark" data-i18n="swayThemeDark">공식 Dark</option><option value="light" data-i18n="swayThemeLight">공식 Light</option><option value="pywal" data-i18n="swayThemePywal">Pywal 자동 생성</option></select></label>
+      <a id="archcraftSupport" class="support-link" href="https://ko-fi.com/s/10f2e87af3" target="_blank" rel="noopener noreferrer" data-i18n="supportArchcraft">멋진 Sway UI를 만든 Archcraft 제작자에게 감사·후원하기</a>
+      <div id="installProgress" class="install-progress" hidden>
+        <div><span data-i18n="installProgress">설치 진행</span><strong id="installProgressValue">0%</strong></div>
+        <progress id="installProgressBar" max="100" value="0"></progress>
+        <p id="installStage" class="hint" aria-live="polite"></p>
+      </div>
+      <div class="buttons"><button id="start" class="primary" data-i18n="start">지금 시작</button><button id="stop" class="danger" data-i18n="stop">중지</button></div>
+      <p id="message" class="message" aria-live="polite"></p>
+    </section>
+
+    <section class="panel">
+      <h2 data-i18n="displayMode">해상도와 주사율</h2>
+      <p class="hint" data-i18n="displayModeHelp">연결된 모니터에서 능동적으로 수집합니다. 100/120/144Hz는 실험적 수동 모드입니다.</p>
+      <div class="mode-grid"><select id="resolution"><option value="auto" data-i18n="automatic">자동 · 모니터 기본값</option></select><select id="refresh" disabled><option>Hz</option></select></div>
+    </section>
+
+    <details class="panel settings">
+      <summary data-i18n="settings">설정</summary>
+      <label><span><b data-i18n="mesa">Mesa</b><small data-i18n="mesaHelp">기본 패키지의 패치 Turnip을 우선하고, 실패하면 KGSL GLES로 자동 폴백합니다.</small></span><select id="mesa"><option value="turnip" data-i18n="mesaTurnipPatched">KGSL + 패치 Turnip · 권장</option><option value="turnip-unpatched" data-i18n="mesaTurnipUnpatched">KGSL + 비패치 Turnip · 호환</option><option value="system" data-i18n="mesaSystem">Debian 시스템 Mesa</option></select></label>
+      <label><span><b data-i18n="autoAttach">DP 자동 시작</b><small data-i18n="autoAttachHelp">새 유효 EDID가 보이면 준비된 프로필 시작</small></span><input id="autoAttach" type="checkbox"></label>
+      <label><span><b data-i18n="xwayland">XWayland</b><small data-i18n="xwaylandHelp">필요한 레거시 X11 앱에만 사용</small></span><input id="xwayland" type="checkbox"></label>
+      <label><span><b data-i18n="phoneTouch">휴대폰 터치 공유</b><small data-i18n="phoneTouchHelp">기본 꺼짐; 내부 터치는 Android에 유지</small></span><input id="shareTouch" type="checkbox"></label>
+      <label><span><b data-i18n="usbInput">USB 독 입력</b><small data-i18n="usbInputHelp">모니터 세션 중 키보드·마우스·터치패드만 Linux 전용</small></span><select id="usbInput"><option value="linux-exclusive" data-i18n="linuxExclusive">Linux 전용 · 권장</option><option value="shared" data-i18n="shared">Android와 공유</option></select></label>
+      <label><span><b data-i18n="video">영상 가속</b><small data-i18n="videoHelp">하드웨어 인코드는 검증됨; 앱 디코드와 PRIME 무복사는 아직 검증 중</small></span><select id="video"><option value="auto" data-i18n="videoAuto">자동 · 검증된 경로 우선</option><option value="disabled" data-i18n="disabled">사용 안 함</option></select></label>
+      <label><span><b data-i18n="outputModifiers">출력 버퍼</b><small data-i18n="outputModifiersHelp">UBWC 우선이 기본이며, 검증 실패 시 원래 장치 형식을 유지</small></span><select id="outputModifiers"><option value="ubwc" data-i18n="outputModifiersUbwc">UBWC 우선 · 기본값</option><option value="auto" data-i18n="outputModifiersAuto">자동 · 호환성 우선</option><option value="linear" data-i18n="outputModifiersLinear">LINEAR 전용</option></select></label>
+      <label><span><b data-i18n="directScanout">직접 스캔아웃</b><small data-i18n="directScanoutHelp">전체화면 창이 안전할 때 stock wlroots가 자동 판단</small></span><select id="directScanout"><option value="auto" data-i18n="directScanoutAuto">자동 · 권장</option><option value="off" data-i18n="directScanoutOff">끄기 · 호환 모드</option></select></label>
+    </details>
+
+    <section id="devPanel" class="panel dev" hidden>
+      <div class="panel-title"><h2 data-i18n="devDiagnostics">개발 진단</h2><div><button id="readLog" data-i18n="readLog">최근 로그 읽기</button><button id="clearLog" data-i18n="clearLog">로그 지우기</button></div></div>
+      <pre id="devLog"></pre>
+    </section>
+    <p class="footer" data-i18n="footer">Release 빌드는 영구 로그를 만들지 않습니다. 강제 케이블 분리 시 전용 세션 그룹을 정리해 DRM lease를 회수합니다.</p>
+  </main>
+  <script src="locales.js?v=311"></script>
+  <script src="app.js?v=311"></script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+#!/system/bin/sh
+set -eu
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+resolve_moddir
+load_config
+
+[ "$(id -u)" -eq 0 ] || { echo "root is required" >&2; exit 1; }
+hardware_check || { rc=$?; echo "unsupported hardware status=$rc" >&2; exit "$rc"; }
+[ -x "$ROOTFS/usr/local/sbin/android-drm-install" ] || {
+    echo "Debian installer payload is missing" >&2; exit 1;
+}
+
+ensure_chroot_mounts
+
+mkdir -p "$ROOTFS/var/cache/android-drm-lease-kit/packages" \
+    "$ROOTFS/var/cache/android-drm-lease-kit/providers" \
+    "$ROOTFS/var/cache/android-drm-lease-kit/profiles" \
+    "$ROOTFS/var/lib/android-drm-lease-kit"
+for archive in "$MODDIR"/packages/*.tar.gz; do
+    [ -f "$archive" ] || continue
+    cp -f "$archive" "$ROOTFS/var/cache/android-drm-lease-kit/packages/"
+done
+
+
+# Restage the pinned official Archcraft Sway dotfiles in case a preserved
+# chroot predates this module revision.
+for archive in "$MODDIR"/profile-assets/*.tar.gz; do
+    [ -f "$archive" ] || continue
+    archive_name=${archive##*/}
+    case "$archive_name" in
+        archcraft-sway-free-e4d0126d.tar.gz|lindex-archcraft-sway-public-assets-v2.tar.gz)
+            [ -r "$archive.sha256" ] || { echo "missing profile asset digest" >&2; exit 1; }
+            (cd "$MODDIR/profile-assets" && sha256sum -c "$archive_name.sha256") || exit 1
+            cp -f "$archive" "$ROOTFS/var/cache/android-drm-lease-kit/profiles/$archive_name"
+            cp -f "$archive.sha256" \
+                "$ROOTFS/var/cache/android-drm-lease-kit/profiles/$archive_name.sha256"
+            ;;
+    esac
+done
+
+dns=$(getprop net.dns1 2>/dev/null)
+{
+    [ -n "$dns" ] && echo "nameserver $dns"
+    echo "nameserver 1.1.1.1"
+} > "$ROOTFS/etc/resolv.conf"
+
+setup_result=0
+/system/bin/chroot "$ROOTFS" /usr/bin/env \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root TMPDIR=/tmp \
+    ANDROID_DRM_PROGRESS_FILE=/var/lib/android-drm-lease-kit/setup-progress \
+    ANDROID_DRM_SWAY_THEME="$SWAY_THEME" \
+    /usr/local/sbin/android-drm-install "$@" || setup_result=$?
+
+# Mounting the chroot /run after boot can hide the production codec socket
+# while its exact old owner remains alive. Reconcile only the identity-checked
+# recorded broker, then require the packaged VA driver and all guest mounts.
+if [ "$VIDEO_ACCELERATION" = auto ]; then
+    prepare_advc_codec_runtime || true
+fi
+exit "$setup_result"

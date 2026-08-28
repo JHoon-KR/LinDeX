@@ -1,0 +1,50 @@
+#!/bin/sh
+# Desktop client started by labwc after the compositor owns the lease.
+set -eu
+desktop=${1:-}
+case "${DRM_LEASE_FD:-}" in
+    ''|*[!0-9]*) ;;
+    *) [ "$DRM_LEASE_FD" -lt 3 ] || eval "exec ${DRM_LEASE_FD}>&-" ;;
+esac
+unset LD_PRELOAD LD_LIBRARY_PATH DRM_LEASE_FD DRM_LEASE_LESSEE_ID DRM_LEASE_OBJECTS
+unset LIBSEAT_BACKEND SEATD_VTBOUND WLR_BACKENDS WLR_DRM_DEVICES WLR_RENDER_DRM_DEVICE
+unset WLR_RENDERER WLR_RENDERER_ALLOW_SOFTWARE WLR_DRM_NO_MODIFIERS
+unset VK_LAYER_PATH VK_INSTANCE_LAYERS
+unset ANDROID_VULKAN_DRM_IDENTITY_ENABLE ANDROID_VULKAN_DRM_IDENTITY_ACK
+unset ANDROID_VULKAN_DRM_IDENTITY_OWNER_PID ANDROID_VULKAN_DRM_IDENTITY_TRACE
+unset ANDROID_USB_INPUT_GRAB
+case "$desktop" in
+    lxqt)
+        # Match the upstream lxqt-wayland-session environment for LXQt 2.1.
+        # In particular, lxqt-panel uses the labwc/wlroots desktop tokens to
+        # select its Wayland backend.  Plain "LXQt" leaves the panel and
+        # desktop helpers alive but without visible layer surfaces.
+        export XDG_CURRENT_DESKTOP=LXQt:labwc:wlroots
+        export XDG_SESSION_DESKTOP=lxqt DESKTOP_SESSION=lxqt
+        export XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+        export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+        export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
+        export XDG_DATA_DIRS=${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+        export XDG_CONFIG_DIRS=${XDG_CONFIG_DIRS:-/etc/xdg:/usr/share}
+        export QT_PLATFORM_PLUGIN=lxqt QT_QPA_PLATFORMTHEME=lxqt
+        export QT_EXCLUDE_GENERIC_BEARER=1 QT_AUTO_SCREEN_SCALE_FACTOR=0
+        export QT_ACCESSIBILITY=1 XDG_MENU_PREFIX=lxqt-
+        mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+            "$HOME/Desktop"
+        exec /usr/bin/lxqt-session
+        ;;
+    xfce)
+        export XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_DESKTOP=xfce DESKTOP_SESSION=xfce
+        export GDK_BACKEND=wayland,x11 QT_QPA_PLATFORM=wayland
+        export CLUTTER_BACKEND=gdk SDL_VIDEODRIVER=wayland MOZ_ENABLE_WAYLAND=1
+        export XDG_DATA_DIRS=${XDG_DATA_DIRS:-/usr/local/share:/usr/share}
+        export XDG_CONFIG_DIRS=${XDG_CONFIG_DIRS:-/etc/xdg}
+        # Run Xfce's normal session bootstrap so its menu, user directories
+        # and D-Bus activation environment are populated.  Tell that bootstrap
+        # that the lease-owning labwc already exists, then attach only the
+        # desktop session to its Wayland socket.
+        export XFCE4_SESSION_COMPOSITOR=/usr/bin/xfce4-session
+        exec /bin/sh /etc/xdg/xfce4/xinitrc
+        ;;
+    *) echo 'invalid desktop client' >&2; exit 2 ;;
+esac

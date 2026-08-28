@@ -1,0 +1,133 @@
+#!/bin/sh
+# Report Android-owned SoC and KGSL identity from inside the Debian chroot.
+set -eu
+
+hardware_file=${LINDEX_HARDWARE_FILE:-/etc/lindex/hardware.conf}
+sys_root=${LINDEX_SYS_ROOT:-}
+lscpu_file=${LINDEX_LSCPU_FILE:-}
+
+read_hardware_value() {
+    key=$1
+    [ -r "$hardware_file" ] || return 1
+    sed -n "s/^${key}=//p" "$hardware_file" | sed -n '1p'
+}
+
+read_lscpu_model() {
+    if [ -n "$lscpu_file" ] && [ -r "$lscpu_file" ]; then
+        sed -n 's/^Model name:[[:space:]]*//p' "$lscpu_file" | sed -n '1p'
+    elif command -v lscpu >/dev/null 2>&1; then
+        lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | sed -n '1p'
+    fi
+}
+
+normalize_vendor() {
+    case $1 in
+        QTI|'Qualcomm Technologies, Inc.'|'Qualcomm Technologies Inc')
+            printf '%s\n' Qualcomm
+            ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+cpu_name() {
+    vendor=$(read_hardware_value soc_manufacturer 2>/dev/null || true)
+    model=$(read_hardware_value soc_model 2>/dev/null || true)
+    architecture=$(read_lscpu_model 2>/dev/null || true)
+    vendor=$(normalize_vendor "$vendor")
+
+    if [ -n "$model" ]; then
+        case " $model " in
+            *" $vendor "*) name=$model ;;
+            *) name=${vendor:+$vendor }$model ;;
+        esac
+        if [ -n "$architecture" ] && [ "$architecture" != "$model" ]; then
+            name="$name ($architecture)"
+        fi
+    elif [ -n "$architecture" ]; then
+        name=${vendor:+$vendor }$architecture
+    else
+        family_file=$sys_root/sys/devices/soc0/family
+        machine_file=$sys_root/sys/devices/soc0/machine
+        if [ -r "$family_file" ]; then
+            family=$(sed -n '1p' "$family_file")
+            name=${vendor:+$vendor }$family
+        elif [ -r "$machine_file" ]; then
+            machine=$(sed -n '1p' "$machine_file")
+            name=${vendor:+$vendor }$machine
+        else
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$name"
+}
+
+normalize_gpu_name() {
+    gpu=$1
+    gpu=$(printf '%s\n' "$gpu" | sed \
+        -e 's/[[:space:]]*(TM)[[:space:]]*/ /g' \
+        -e 's/^Adreno\([0-9]\)/Adreno \1/' \
+        -e 's/v\([0-9][0-9]*\)$/ v\1/' \
+        -e 's/[[:space:]][[:space:]]*/ /g' \
+        -e 's/^ //; s/ $//')
+    case $gpu in
+        Qualcomm\ *) ;;
+        Adreno\ *) gpu="Qualcomm $gpu" ;;
+    esac
+    printf '%s\n' "$gpu"
+}
+
+gpu_name() {
+    gpu=
+    for gpu_file in "$sys_root"/sys/class/kgsl/*/gpu_model; do
+        [ -r "$gpu_file" ] || continue
+        gpu=$(sed -n '1p' "$gpu_file")
+        [ -n "$gpu" ] && break
+    done
+    [ -n "$gpu" ] || gpu=$(read_hardware_value gpu_model 2>/dev/null || true)
+    [ -n "$gpu" ] || return 1
+    normalize_gpu_name "$gpu"
+}
+
+cpu_max_khz() {
+    max=0
+    for freq_file in "$sys_root"/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq; do
+        [ -r "$freq_file" ] || continue
+        value=$(sed -n '1p' "$freq_file")
+        case $value in ''|*[!0-9]*) continue ;; esac
+        [ "$value" -le "$max" ] || max=$value
+    done
+    [ "$max" -gt 0 ] || return 1
+    printf '%s\n' "$max"
+}
+
+cpu_cores() {
+    online_file=$sys_root/sys/devices/system/cpu/online
+    if [ -r "$online_file" ]; then
+        awk -F, '
+            {
+                for (i = 1; i <= NF; i++) {
+                    split($i, range, "-")
+                    count += (range[2] == "" ? 1 : range[2] - range[1] + 1)
+                }
+            }
+            END { if (count > 0) print count }
+        ' "$online_file"
+        return
+    fi
+    if command -v getconf >/dev/null 2>&1; then
+        getconf _NPROCESSORS_ONLN 2>/dev/null && return
+    fi
+    grep -c '^processor[[:space:]]*:' "$sys_root/proc/cpuinfo"
+}
+
+case ${1:-} in
+    cpu) cpu_name ;;
+    gpu) gpu_name ;;
+    cpu-max-khz) cpu_max_khz ;;
+    cpu-cores) cpu_cores ;;
+    *)
+        echo 'usage: lindex-hardware-info cpu|gpu|cpu-max-khz|cpu-cores' >&2
+        exit 2
+        ;;
+esac

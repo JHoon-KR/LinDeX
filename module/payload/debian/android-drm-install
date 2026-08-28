@@ -1,0 +1,273 @@
+#!/bin/sh
+# Install Mesa plus one LinDeX stock/open-source compositor profile.
+set -eu
+
+# Some Android tethering/proxy paths corrupt pipelined HTTP responses.  Keep
+# package setup retryable and deterministic without changing Debian sources.
+apt_get() {
+    apt-get -o Acquire::http::Pipeline-Depth=0 -o Acquire::Retries=3 "$@"
+}
+
+MESA_MODE=turnip
+PROFILE=sway
+STATE=/var/lib/android-drm-lease-kit
+CACHE=/var/cache/android-drm-lease-kit
+STANDARD_TAG=mesa-26.2.0-devel-20260709
+STANDARD_FILE=mesa-for-android-container_26.2.0-devel-20260709_debian_trixie_arm64.tar.gz
+STANDARD_SHA=4ee525b4844fb189f3762ff75ef77f5b80eee8f6cdab2e5588731b5c9f8168bb
+STANDARD_URL=https://github.com/lfdevs/mesa-for-android-container/releases/download/$STANDARD_TAG/$STANDARD_FILE
+TURNIP_TAG=turnip-26.2.0-devel-20260709
+TURNIP_FILE=turnip_26.2.0-devel-20260709_debian_trixie_arm64.tar.gz
+TURNIP_SHA=70d997ba9080933d8858e40129502cab66f9eb1c1d24360ab257bacaa9ad0684
+TURNIP_URL=https://github.com/lfdevs/mesa-for-android-container/releases/download/$TURNIP_TAG/$TURNIP_FILE
+NEOFETCH_FILE=neofetch-7.1.0
+NEOFETCH_SHA=3dc33493e54029fb1528251552093a9f9a2894fcf94f9c3a6f809136a42348c7
+NEOFETCH_URL=https://raw.githubusercontent.com/dylanaraps/neofetch/7.1.0/neofetch
+PROGRESS_FILE=${ANDROID_DRM_PROGRESS_FILE:-$STATE/setup-progress}
+
+write_progress() {
+    percent=$1 stage=$2 detail=$3
+    mkdir -p "${PROGRESS_FILE%/*}"
+    progress_tmp=$PROGRESS_FILE.tmp.$$
+    {
+        echo 'format=1'
+        echo "profile=$PROFILE"
+        echo "mesa=$MESA_MODE"
+        echo "percent=$percent"
+        echo "stage=$stage"
+        echo "detail=$detail"
+        echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$progress_tmp"
+    chmod 0600 "$progress_tmp" 2>/dev/null || true
+    mv -f "$progress_tmp" "$PROGRESS_FILE"
+}
+
+usage() {
+    echo 'usage: android-drm-install [--mesa turnip|turnip-unpatched|system] --profile PROFILE'
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --mesa) [ "$#" -ge 2 ] || exit 2; MESA_MODE=$2; shift 2 ;;
+        --profile)
+            [ "$#" -ge 2 ] || exit 2
+            # Compatibility with the v3 controller's first development draft.
+            if [ "$2" = desktop ]; then shift 2; else PROFILE=$2; shift 2; fi
+            ;;
+        --desktop) [ "$#" -ge 2 ] || exit 2; PROFILE=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+case "$MESA_MODE" in
+    # Compatibility with pre-release v3 configuration files.  The standard
+    # archive already contains the patched Turnip Vulkan driver.
+    standard) MESA_MODE=turnip ;;
+    turnip|turnip-unpatched|system) ;;
+    *) usage >&2; exit 2 ;;
+esac
+case "$PROFILE" in lxqt|xfce|sway) ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+write_progress 5 preflight validating-device-and-rootfs
+
+[ "$(id -u)" -eq 0 ] || { echo 'root is required' >&2; exit 1; }
+[ "$(dpkg --print-architecture)" = arm64 ] || { echo 'ARM64 Debian is required' >&2; exit 1; }
+grep -qE '^(VERSION_CODENAME|DEBIAN_CODENAME)=trixie$' /etc/os-release || {
+    echo 'Debian trixie is required' >&2
+    exit 1
+}
+[ -e /dev/kgsl-3d0 ] || { echo 'Adreno KGSL device is not mounted' >&2; exit 1; }
+[ -e /dev/dri/card0 ] || { echo 'MSM/SDE DRM card0 is not mounted' >&2; exit 1; }
+[ -x /usr/local/libexec/android-drm/profile-configurator ] || {
+    echo 'profile configurator is missing' >&2
+    exit 1
+}
+[ -x /usr/local/libexec/android-drm/profile-runtime-manager ] || {
+    echo 'internal profile runtime installer is missing' >&2
+    exit 1
+}
+[ -r /opt/android-drm-lease-kit/bridge/stock-profile-bridge-v12/BRIDGE_RUNTIME.sha256 ] || {
+    echo 'stock profile bridge v12 is missing' >&2
+    exit 1
+}
+
+mkdir -p "$STATE/transactions" "$STATE/profiles" "$CACHE/packages"
+export DEBIAN_FRONTEND=noninteractive
+write_progress 12 base-packages refreshing-debian-packages
+apt_get update
+
+# Migrate rootfs instances created by pre-release LinDeX builds.  Removing the
+# lxqt-core metapackage does not remove its desktop components, and this command
+# deliberately does not run autoremove.
+obsolete_profile_packages=
+for obsolete_package in lxpolkit xfce-polkit lxqt-policykit lxqt-core; do
+    if dpkg-query -W -f='${Status}\n' "$obsolete_package" 2>/dev/null |
+       grep -qx 'install ok installed'; then
+        obsolete_profile_packages="$obsolete_profile_packages $obsolete_package"
+    fi
+done
+if [ -n "$obsolete_profile_packages" ]; then
+    write_progress 16 base-packages removing-obsolete-policy-agents
+    # Names come exclusively from the fixed list above. Do not autoremove the
+    # LXQt components that were previously dependencies of lxqt-core.
+    # shellcheck disable=SC2086
+    apt_get purge -y $obsolete_profile_packages
+fi
+
+write_progress 20 base-packages installing-common-runtime
+apt_get install -y --no-install-recommends \
+    ca-certificates curl python3 gzip xz-utils zstd tar file pci.ids util-linux dbus-x11 udev \
+    vulkan-tools mesa-utils \
+    ffmpeg vainfo gstreamer1.0-tools gstreamer1.0-vaapi gstreamer1.0-plugins-bad \
+    libwayland-server0 libwayland-client0 libdrm2 libgbm1 libegl1 libgles2 \
+    libvulkan1 libxkbcommon0 libpixman-1-0 liblcms2-2 libudev1 libseat1 \
+    libdisplay-info2 libliftoff0 libinput10 \
+    libxcb1 libxcb-dri3-0 libxcb-present0 libxcb-render0 \
+    libxcb-render-util0 libxcb-shm0 libxcb-xfixes0 libxcb-xinput0 \
+    libxcb-composite0 libxcb-ewmh2 libxcb-icccm4 libxcb-res0 libxcb-errors0
+
+write_progress 38 mesa preparing-mesa-runtime
+
+fetch_checked() {
+    file=$1 url=$2 sha=$3
+    path=$CACHE/packages/$file
+    if [ ! -f "$path" ]; then
+        echo "Downloading $url" >&2
+        curl --fail --location --retry 3 --output "$path.part" "$url"
+        mv "$path.part" "$path"
+    fi
+    printf '%s  %s\n' "$sha" "$path" | sha256sum -c - >&2
+    printf '%s\n' "$path"
+}
+
+install_neofetch() {
+    source_file=$(fetch_checked "$NEOFETCH_FILE" "$NEOFETCH_URL" "$NEOFETCH_SHA")
+    real_file=/usr/local/libexec/android-drm/neofetch-7.1.0
+    grep -q '^version=7\.1\.0$' "$source_file" || {
+        echo 'pinned Neofetch source has an unexpected version' >&2
+        exit 1
+    }
+    if [ ! -x "$real_file" ] ||
+       [ "$(sha256sum "$real_file" 2>/dev/null | awk '{print $1}')" != "$NEOFETCH_SHA" ]; then
+        install -o root -g root -m 0755 "$source_file" "$real_file"
+    fi
+    [ -x /usr/local/bin/neofetch ] || {
+        echo 'LinDeX Neofetch wrapper is missing' >&2
+        exit 1
+    }
+    [ -x /usr/local/libexec/android-drm/lindex-hardware-info ] || {
+        echo 'LinDeX hardware identity helper is missing' >&2
+        exit 1
+    }
+    [ -r /usr/local/share/android-drm/neofetch.conf ] || {
+        echo 'LinDeX Neofetch hardware adapter is missing' >&2
+        exit 1
+    }
+}
+
+install_neofetch
+
+install_overlay_archive() {
+    archive=$1 label=$2 force=${3:-0}
+    already=$STATE/mesa-$label.ready
+    if [ "$force" != 1 ] && [ -r "$already" ] && [ "$(sha256sum "$archive" | awk '{print $1}')" = \
+       "$(sed -n 's/^archive_sha256=//p' "$already")" ]; then
+        return 0
+    fi
+    txn=$STATE/transactions/$(date +%Y%m%d%H%M%S)-$label
+    mkdir -p "$txn"
+    tar -tzf "$archive" | sed 's#^\./##; /^$/d' > "$txn/manifest.all"
+    if grep -Eq '(^/|(^|/)\.\.(/|$))' "$txn/manifest.all"; then
+        echo "unsafe archive path in $archive" >&2
+        exit 1
+    fi
+    : > "$txn/existing.list"
+    while IFS= read -r path; do
+        case "$path" in */|'') continue ;; esac
+        [ ! -e "/$path" ] && [ ! -L "/$path" ] || echo "$path" >> "$txn/existing.list"
+    done < "$txn/manifest.all"
+    if [ -s "$txn/existing.list" ]; then
+        tar -C / -czf "$txn/backup.tar.gz" -T "$txn/existing.list"
+    else
+        tar -czf "$txn/backup.tar.gz" --files-from /dev/null
+    fi
+    sha256sum "$archive" > "$txn/archive.sha256"
+    tar -xzf "$archive" -C /
+    {
+        echo "label=$label"
+        echo "archive_sha256=$(sha256sum "$archive" | awk '{print $1}')"
+        echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$already.tmp.$$"
+    chmod 0600 "$already.tmp.$$"
+    mv "$already.tmp.$$" "$already"
+}
+
+previous_schema=$(sed -n 's/^MESA_SELECTION_SCHEMA=//p' "$STATE/install.conf" 2>/dev/null || true)
+previous_mode=$(sed -n 's/^MESA_MODE=//p' "$STATE/install.conf" 2>/dev/null || true)
+force_standard=0
+force_unpatched=0
+case "$MESA_MODE" in
+    turnip)
+        # Old MESA_MODE=turnip meant that the separate unpatched archive had
+        # overwritten the standard package.  Re-extract the standard archive
+        # once so upgrades really return to its patched Turnip driver.
+        if [ "$previous_schema" != 2 ] || [ "$previous_mode" != turnip ]; then
+            force_standard=1
+        fi
+        ;;
+    turnip-unpatched)
+        case "$previous_schema:$previous_mode" in
+            2:turnip|2:turnip-unpatched) ;;
+            *) force_standard=1 ;;
+        esac
+        [ "$previous_schema:$previous_mode" = 2:turnip-unpatched ] || force_unpatched=1
+        ;;
+esac
+
+case "$MESA_MODE" in
+    system)
+        write_progress 45 mesa installing-debian-system-mesa
+        apt_get install -y mesa-vulkan-drivers mesa-va-drivers mesa-vdpau-drivers
+        echo 'WARNING: Debian system Mesa may not provide the Android KGSL path.' >&2
+        ;;
+    turnip|turnip-unpatched)
+        write_progress 45 mesa installing-kgsl-patched-turnip
+        standard_archive=$(fetch_checked "$STANDARD_FILE" "$STANDARD_URL" "$STANDARD_SHA")
+        install_overlay_archive "$standard_archive" "$STANDARD_TAG" "$force_standard"
+        if [ "$MESA_MODE" = turnip-unpatched ]; then
+            write_progress 55 mesa installing-unpatched-turnip-compatibility
+            turnip_archive=$(fetch_checked "$TURNIP_FILE" "$TURNIP_URL" "$TURNIP_SHA")
+            install_overlay_archive "$turnip_archive" "$TURNIP_TAG" "$force_unpatched"
+        fi
+        ;;
+esac
+
+write_progress 62 profile-runtime preparing-profile-runtime
+
+# All three release profiles go through one package-and-command verifier.  Sway
+# additionally requires the pinned official appearance payload to be verified.
+/usr/local/libexec/android-drm/profile-configurator \
+    install --profile "$PROFILE"
+write_progress 94 finalizing refreshing-runtime-linker
+ldconfig
+
+profile_marker=$STATE/profiles/$PROFILE.ready
+[ -r "$profile_marker" ] || { echo "profile marker was not created: $PROFILE" >&2; exit 1; }
+{
+    echo "MESA_SELECTION_SCHEMA=2"
+    echo "MESA_MODE=$MESA_MODE"
+    echo "PROFILE=$PROFILE"
+    echo "MESA_STANDARD_TAG=$STANDARD_TAG"
+    if [ "$MESA_MODE" = turnip-unpatched ]; then
+        echo "MESA_UNPATCHED_TURNIP_TAG=$TURNIP_TAG"
+    else
+        echo "MESA_UNPATCHED_TURNIP_TAG=none"
+    fi
+    echo "INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$STATE/install.conf.tmp.$$"
+chmod 0600 "$STATE/install.conf.tmp.$$"
+mv "$STATE/install.conf.tmp.$$" "$STATE/install.conf"
+write_progress 100 complete profile-and-mesa-ready
+echo "Stock profile and Mesa are ready: $PROFILE"

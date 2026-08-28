@@ -1,0 +1,472 @@
+#!/system/bin/sh
+
+# Reconcile exactly one trusted ADVC production socket owner. Every signal is
+# preceded by a fresh process identity check; no process-name-wide operation is
+# permitted here.
+umask 077
+if [ -z "$MODDIR" ]; then
+    MODDIR=${0%/*}
+    MODDIR=${MODDIR%/*}
+fi
+ADVC_STATE_DIR=${ADVC_STATE_DIR:-/data/adb/debian-drm-lease-kit/state}
+ADVC_PROC_ROOT=${ADVC_PROC_ROOT:-/proc}
+ADVC_BROKER_PATH=${ADVC_BROKER_PATH:-$MODDIR/bin/advc-broker}
+ADVC_PRODUCTION_SOCKET=${ADVC_PRODUCTION_SOCKET:-/data/local/debian/run/android-drm/advc-broker-1.1.sock}
+ADVC_LEGACY_BROKER_PATH=${ADVC_LEGACY_BROKER_PATH:-/data/local/tmp/advc-broker-1.1}
+ADVC_TERM_WAIT_STEPS=${ADVC_TERM_WAIT_STEPS:-20}
+ADVC_KILL_WAIT_STEPS=${ADVC_KILL_WAIT_STEPS:-20}
+ADVC_START_WAIT_STEPS=${ADVC_START_WAIT_STEPS:-50}
+ADVC_WAIT_SECONDS=${ADVC_WAIT_SECONDS:-0.1}
+ADVC_TRUSTED_SOCKET_UID=${ADVC_TRUSTED_SOCKET_UID:-0}
+ADVC_TRUSTED_SOCKET_GID=${ADVC_TRUSTED_SOCKET_GID:-0}
+# This token is intentionally fixed by the packaged release.  A caller cannot
+# widen codec advertisement with an arbitrary inherited environment value.
+ADVC_DECODE_PRIME_VALIDATION=validated-qcom-prime-repack-linear-fence-eos-v1
+export ADVC_DECODE_PRIME_VALIDATION
+ADVC_PID_FILE="$ADVC_STATE_DIR/advc-broker.pid"
+ADVC_LOCK_FILE="$ADVC_STATE_DIR/advc-broker.lock"
+ADVC_CMDLINE_EXPECTED="$ADVC_STATE_DIR/advc-cmdline.expected.$$"
+
+mkdir -p "$ADVC_STATE_DIR" || exit 1
+
+BUILD_FLAVOR=${BUILD_FLAVOR:-release}
+[ -r "$MODDIR/flavor.conf" ] && . "$MODDIR/flavor.conf"
+case "$BUILD_FLAVOR" in release|dev) ;; *) BUILD_FLAVOR=release ;; esac
+if [ "$BUILD_FLAVOR" = dev ]; then
+    ADVC_LOG_FILE=${ADVC_LOG_FILE:-$ADVC_STATE_DIR/advc-broker.log}
+    ADVC_EVENT_LOG=${ADVC_EVENT_LOG:-$ADVC_STATE_DIR/session.log}
+else
+    # Release builds keep only operational PID/lock state. Diagnostics are
+    # available in the explicitly selected dev package, never accumulated by
+    # the normal one-button release runtime.
+    ADVC_LOG_FILE=/dev/null
+    ADVC_EVENT_LOG=/dev/null
+    rm -f "$ADVC_STATE_DIR/advc-broker.log" \
+        "$ADVC_STATE_DIR/advc-broker.previous.log" \
+        "$ADVC_STATE_DIR/session.log" \
+        "$ADVC_STATE_DIR/session.previous.log"
+fi
+
+advc_log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$ADVC_EVENT_LOG"
+}
+
+advc_sha256() {
+    [ -f "$1" ] || return 1
+    sha256sum "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+advc_socket_inode() {
+    [ -r "$ADVC_PROC_ROOT/net/unix" ] || return 2
+    socket_inodes=$(awk -v path="$ADVC_PRODUCTION_SOCKET" '
+        NF >= 8 && $8 == path { print $7 }
+    ' "$ADVC_PROC_ROOT/net/unix")
+    socket_count=$(printf '%s\n' "$socket_inodes" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$socket_count" -eq 1 ] || {
+        [ "$socket_count" -eq 0 ] && return 1
+        return 2
+    }
+    printf '%s\n' "$socket_inodes"
+}
+
+advc_socket_owner() {
+    target_inode=$1
+    owners=
+    # Android processes commonly hold tens of thousands of descriptors.  A
+    # readlink process per descriptor can keep the boot hook busy for minutes.
+    # On the real procfs, use Android's single lsof snapshot and still require
+    # both the exact socket path and the inode independently read from
+    # /proc/net/unix.  Fixture proc roots retain the explicit fd walk below.
+    if [ "$ADVC_PROC_ROOT" = /proc ] && command -v lsof >/dev/null 2>&1; then
+        owners=$(lsof 2>/dev/null | awk -v path="$ADVC_PRODUCTION_SOCKET" \
+            -v inode="$target_inode" '
+                NF >= 2 && $NF == path && $(NF - 1) == inode { print $2 }
+            ' | awk '!seen[$1]++')
+        owner_count=$(printf '%s\n' "$owners" | awk 'NF { count++ } END { print count + 0 }')
+        [ "$owner_count" -eq 1 ] || return 1
+        printf '%s\n' "$owners" | awk 'NF { print; exit }'
+        return 0
+    fi
+    for proc_dir in "$ADVC_PROC_ROOT"/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+        owner_pid=${proc_dir##*/}
+        for fd_path in "$proc_dir"/fd/*; do
+            [ -L "$fd_path" ] || continue
+            [ "$(readlink "$fd_path" 2>/dev/null)" = "socket:[$target_inode]" ] || continue
+            case " $owners " in
+                *" $owner_pid "*) ;;
+                *) owners="$owners $owner_pid" ;;
+            esac
+            break
+        done
+    done
+    owner_count=$(printf '%s\n' "$owners" | awk '{ print NF }')
+    [ "$owner_count" -eq 1 ] || return 1
+    printf '%s\n' "$owners" | awk '{ print $1 }'
+}
+
+advc_process_exists() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "$ADVC_PROC_ROOT/$1" ]
+}
+
+advc_root_uid() {
+    awk '/^Uid:/ {
+        if ($2 == 0 && $3 == 0 && $4 == 0 && $5 == 0) ok=1
+    } END { exit ok ? 0 : 1 }' "$ADVC_PROC_ROOT/$1/status" 2>/dev/null
+}
+
+advc_allowed_exe() {
+    case "$1" in
+        "$ADVC_BROKER_PATH"|\
+        /data/adb/modules/debian_chroot/bin/advc-broker|\
+        /data/adb/modules_update/debian_chroot/bin/advc-broker|\
+        "$ADVC_LEGACY_BROKER_PATH")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+advc_cmdline_exact() {
+    pid=$1
+    exe_arg=$2
+    printf '%s\0%s\0' "$exe_arg" "$ADVC_PRODUCTION_SOCKET" > "$ADVC_CMDLINE_EXPECTED" ||
+        return 1
+    chmod 0600 "$ADVC_CMDLINE_EXPECTED" 2>/dev/null || true
+    cmp -s "$ADVC_PROC_ROOT/$pid/cmdline" "$ADVC_CMDLINE_EXPECTED"
+}
+
+advc_start_time() {
+    awk '{ print $22 }' "$ADVC_PROC_ROOT/$1/stat" 2>/dev/null
+}
+
+advc_process_state() {
+    awk '{ print $3 }' "$ADVC_PROC_ROOT/$1/stat" 2>/dev/null
+}
+
+advc_identity() {
+    identity_pid=$1
+    advc_process_exists "$identity_pid" || return 1
+    [ -f "$ADVC_PROC_ROOT/$identity_pid/exe" ] || return 1
+    advc_root_uid "$identity_pid" || return 1
+    identity_exe=$(readlink "$ADVC_PROC_ROOT/$identity_pid/exe" 2>/dev/null) || return 1
+    # Android procfs appends the literal suffix " (deleted)" after KernelSU
+    # replaces an executing module binary.  mksh does not reliably remove that
+    # suffix with `${value% (deleted)}`.  Match it explicitly, then remove the
+    # final space-delimited marker before comparing the immutable argv path.
+    case "$identity_exe" in
+        *' (deleted)') identity_exe_arg=${identity_exe% *} ;;
+        *) identity_exe_arg=$identity_exe ;;
+    esac
+    advc_allowed_exe "$identity_exe_arg" || return 1
+    advc_cmdline_exact "$identity_pid" "$identity_exe_arg" || return 1
+    identity_start=$(advc_start_time "$identity_pid")
+    identity_exe_sha=$(advc_sha256 "$ADVC_PROC_ROOT/$identity_pid/exe")
+    identity_cmd_sha=$(advc_sha256 "$ADVC_PROC_ROOT/$identity_pid/cmdline")
+    [ -n "$identity_start" ] && [ -n "$identity_exe_sha" ] &&
+        [ -n "$identity_cmd_sha" ] || return 1
+    printf '%s|%s|%s|%s\n' "$identity_start" "$identity_exe" \
+        "$identity_exe_sha" "$identity_cmd_sha"
+}
+
+advc_identity_unchanged() {
+    [ "$(advc_identity "$1" 2>/dev/null)" = "$2" ]
+}
+
+advc_signal_checked() {
+    signal_name=$1
+    signal_pid=$2
+    signal_identity=$3
+    advc_identity_unchanged "$signal_pid" "$signal_identity" || return 2
+    if [ -n "$ADVC_SIGNAL_HOOK" ]; then
+        "$ADVC_SIGNAL_HOOK" "$signal_name" "$signal_pid"
+    else
+        kill "-$signal_name" "$signal_pid"
+    fi
+}
+
+advc_wait_step() {
+    [ "$ADVC_WAIT_SECONDS" = 0 ] || sleep "$ADVC_WAIT_SECONDS"
+}
+
+advc_wait_for_exit() {
+    wait_pid=$1
+    wait_identity=$2
+    wait_steps=$3
+    wait_start=$(printf '%s\n' "$wait_identity" | awk -F '|' '{ print $1 }')
+    wait_index=0
+    while [ "$wait_index" -lt "$wait_steps" ]; do
+        current_identity=$(advc_identity "$wait_pid" 2>/dev/null)
+        if [ -z "$current_identity" ]; then
+            advc_process_exists "$wait_pid" || return 0
+            current_start=$(advc_start_time "$wait_pid")
+            [ -n "$current_start" ] && [ "$current_start" = "$wait_start" ] || return 2
+            # A terminated process may remain briefly as the same zombie after
+            # its executable link disappears.  It cannot own or rebind the
+            # socket, and its unchanged start time proves this is not PID reuse.
+            [ "$(advc_process_state "$wait_pid")" = Z ] && return 0
+            return 2
+        fi
+        [ "$current_identity" = "$wait_identity" ] || return 2
+        advc_wait_step
+        wait_index=$((wait_index + 1))
+    done
+    return 1
+}
+
+advc_socket_stat() {
+    stat -c '%d:%i:%F:%u:%g' "$ADVC_PRODUCTION_SOCKET" 2>/dev/null
+}
+
+advc_remove_unbound_socket() {
+    unbound_stat=$(advc_socket_stat) || return 1
+    case "$ADVC_TRUSTED_SOCKET_UID" in ''|*[!0-9]*) return 1 ;; esac
+    case "$ADVC_TRUSTED_SOCKET_GID" in ''|*[!0-9]*) return 1 ;; esac
+    case "$unbound_stat" in
+        *:socket:"$ADVC_TRUSTED_SOCKET_UID":"$ADVC_TRUSTED_SOCKET_GID") ;;
+        *) return 1 ;;
+    esac
+    advc_socket_inode >/dev/null 2>&1
+    [ "$?" -eq 1 ] || return 1
+    advc_wait_step
+    [ "$(advc_socket_stat)" = "$unbound_stat" ] || return 1
+    advc_socket_inode >/dev/null 2>&1
+    [ "$?" -eq 1 ] || return 1
+    rm -f "$ADVC_PRODUCTION_SOCKET"
+}
+
+advc_write_pid() {
+    pid_value=$1
+    pid_tmp="$ADVC_PID_FILE.tmp.$$"
+    printf '%s\n' "$pid_value" > "$pid_tmp" || return 1
+    chmod 0600 "$pid_tmp" 2>/dev/null || true
+    mv -f "$pid_tmp" "$ADVC_PID_FILE"
+}
+
+advc_launch() {
+    if [ -n "$ADVC_LAUNCH_HOOK" ]; then
+        "$ADVC_LAUNCH_HOOK" "$ADVC_BROKER_PATH" "$ADVC_PRODUCTION_SOCKET" "$ADVC_LOG_FILE"
+        return
+    fi
+    "$ADVC_BROKER_PATH" "$ADVC_PRODUCTION_SOCKET" >> "$ADVC_LOG_FILE" 2>&1 &
+    printf '%s\n' "$!"
+}
+
+advc_wait_for_ready() {
+    ready_pid=$1
+    ready_index=0
+    while [ "$ready_index" -lt "$ADVC_START_WAIT_STEPS" ]; do
+        if advc_process_exists "$ready_pid"; then
+            ready_identity=$(advc_identity "$ready_pid" 2>/dev/null)
+            ready_inode=$(advc_socket_inode 2>/dev/null)
+            ready_owner=
+            [ -n "$ready_inode" ] &&
+                ready_owner=$(advc_socket_owner "$ready_inode" 2>/dev/null)
+            [ -n "$ready_identity" ] && [ "$ready_owner" = "$ready_pid" ] && return 0
+        else
+            return 1
+        fi
+        advc_wait_step
+        ready_index=$((ready_index + 1))
+    done
+    return 1
+}
+
+advc_start_active() {
+    mkdir -p "${ADVC_PRODUCTION_SOCKET%/*}" || return 1
+    new_pid=$(advc_launch) || return 1
+    case "$new_pid" in ''|*[!0-9]*) return 1 ;; esac
+    if ! advc_wait_for_ready "$new_pid"; then
+        advc_log "ADVC broker start failed pid=$new_pid"
+        return 1
+    fi
+    advc_write_pid "$new_pid" || return 1
+    advc_log "ADVC broker started pid=$new_pid sha=$(advc_sha256 "$ADVC_BROKER_PATH")"
+}
+
+advc_retire_recorded_without_socket() {
+    registered_inode=${1:-}
+    recorded_pid=$(cat "$ADVC_PID_FILE" 2>/dev/null)
+    case "$recorded_pid" in
+        '') return 0 ;;
+        *[!0-9]*|0|1) rm -f "$ADVC_PID_FILE"; return 0 ;;
+    esac
+    if ! advc_process_exists "$recorded_pid"; then
+        rm -f "$ADVC_PID_FILE"
+        return 0
+    fi
+    if [ -n "$registered_inode" ]; then
+        registered_owner=$(advc_socket_owner "$registered_inode" 2>/dev/null) || {
+            advc_log "ADVC broker reconcile refused reason=socketless-owner-unresolved inode=$registered_inode"
+            return 1
+        }
+        [ "$registered_owner" = "$recorded_pid" ] || {
+            advc_log "ADVC broker reconcile refused reason=socketless-owner-pid-mismatch recorded=$recorded_pid owner=$registered_owner"
+            return 1
+        }
+    fi
+    recorded_identity=$(advc_identity "$recorded_pid" 2>/dev/null) || {
+        advc_log "ADVC broker reconcile refused reason=recorded-pid-identity-invalid pid=$recorded_pid"
+        return 1
+    }
+    advc_signal_checked TERM "$recorded_pid" "$recorded_identity" || return 1
+    advc_wait_for_exit "$recorded_pid" "$recorded_identity" \
+        "$ADVC_TERM_WAIT_STEPS"
+    recorded_wait=$?
+    if [ "$recorded_wait" -eq 1 ]; then
+        advc_signal_checked KILL "$recorded_pid" "$recorded_identity" || return 1
+        advc_wait_for_exit "$recorded_pid" "$recorded_identity" \
+            "$ADVC_KILL_WAIT_STEPS" || return 1
+    elif [ "$recorded_wait" -ne 0 ]; then
+        return 1
+    fi
+    rm -f "$ADVC_PID_FILE"
+    if [ -n "$registered_inode" ]; then
+        advc_socket_inode >/dev/null 2>&1
+        [ "$?" -eq 1 ] || return 1
+    fi
+    advc_log "ADVC broker retired recorded socketless owner pid=$recorded_pid"
+}
+
+advc_reconcile_locked() {
+    active_sha=$(advc_sha256 "$ADVC_BROKER_PATH") || {
+        advc_log "ADVC broker reconcile refused reason=active-binary-invalid"
+        return 1
+    }
+
+    if [ ! -S "$ADVC_PRODUCTION_SOCKET" ]; then
+        if [ -e "$ADVC_PRODUCTION_SOCKET" ]; then
+            advc_log "ADVC broker reconcile refused reason=foreign-nonsocket-node"
+            return 1
+        fi
+        advc_socket_inode >/dev/null 2>&1
+        socket_lookup=$?
+        case "$socket_lookup" in
+            0)
+                socketless_inode=$(advc_socket_inode 2>/dev/null) || return 1
+                advc_retire_recorded_without_socket "$socketless_inode" || return 1
+                advc_start_active
+                return
+                ;;
+            1) ;;
+            *)
+                advc_log "ADVC broker reconcile refused reason=proc-socket-state-unavailable"
+                return 1
+                ;;
+        esac
+        advc_retire_recorded_without_socket '' || return 1
+        advc_start_active
+        return
+    fi
+
+    old_socket_stat=$(advc_socket_stat)
+    [ -n "$old_socket_stat" ] || {
+        advc_log "ADVC broker reconcile refused reason=socket-stat-unavailable"
+        return 1
+    }
+    old_inode=$(advc_socket_inode 2>/dev/null)
+    old_inode_result=$?
+    if [ "$old_inode_result" -eq 1 ]; then
+        if advc_remove_unbound_socket; then
+            advc_log "ADVC broker removed exact unbound production socket"
+            advc_start_active
+            return
+        fi
+        advc_log "ADVC broker reconcile refused reason=unbound-socket-untrusted"
+        return 1
+    fi
+    if [ "$old_inode_result" -ne 0 ]; then
+        advc_log "ADVC broker reconcile refused reason=socket-owner-unresolved"
+        return 1
+    fi
+    old_pid=$(advc_socket_owner "$old_inode" 2>/dev/null) || {
+        advc_log "ADVC broker reconcile refused reason=socket-owner-missing"
+        return 1
+    }
+    old_identity=$(advc_identity "$old_pid" 2>/dev/null) || {
+        advc_log "ADVC broker reconcile refused reason=foreign-or-invalid-owner pid=$old_pid"
+        return 1
+    }
+    old_sha=$(printf '%s\n' "$old_identity" | awk -F '|' '{ print $3 }')
+    if [ "$old_sha" = "$active_sha" ]; then
+        advc_write_pid "$old_pid" || return 1
+        advc_log "ADVC broker current pid=$old_pid sha=$active_sha action=keep"
+        return 0
+    fi
+
+    advc_signal_checked TERM "$old_pid" "$old_identity"
+    signal_result=$?
+    if [ "$signal_result" -eq 2 ]; then
+        advc_log "ADVC broker rollover refused reason=pid-reuse-before-term pid=$old_pid"
+        return 1
+    fi
+    if [ "$signal_result" -ne 0 ]; then
+        advc_log "ADVC broker rollover failed reason=term-signal pid=$old_pid status=$signal_result"
+        return 1
+    fi
+    advc_wait_for_exit "$old_pid" "$old_identity" "$ADVC_TERM_WAIT_STEPS"
+    wait_result=$?
+    if [ "$wait_result" -eq 2 ]; then
+        advc_log "ADVC broker rollover refused reason=pid-reused-after-term pid=$old_pid"
+        return 1
+    fi
+    if [ "$wait_result" -ne 0 ]; then
+        advc_signal_checked KILL "$old_pid" "$old_identity"
+        signal_result=$?
+        if [ "$signal_result" -eq 2 ]; then
+            advc_log "ADVC broker rollover refused reason=pid-reuse-before-kill pid=$old_pid"
+            return 1
+        fi
+        if [ "$signal_result" -ne 0 ]; then
+            advc_log "ADVC broker rollover failed reason=kill-signal pid=$old_pid status=$signal_result"
+            return 1
+        fi
+        advc_wait_for_exit "$old_pid" "$old_identity" "$ADVC_KILL_WAIT_STEPS"
+        kill_wait=$?
+        [ "$kill_wait" -eq 0 ] || {
+            advc_log "ADVC broker rollover refused reason=kill-not-confirmed pid=$old_pid status=$kill_wait"
+            return 1
+        }
+    fi
+
+    if [ -e "$ADVC_PRODUCTION_SOCKET" ]; then
+        [ -S "$ADVC_PRODUCTION_SOCKET" ] &&
+            [ "$(advc_socket_stat)" = "$old_socket_stat" ] || {
+                advc_log "ADVC broker rollover refused reason=socket-node-changed"
+                return 1
+            }
+        advc_socket_inode >/dev/null 2>&1
+        socket_lookup=$?
+        case "$socket_lookup" in
+            0)
+                advc_log "ADVC broker rollover refused reason=socket-rebound"
+                return 1
+                ;;
+            1) ;;
+            *)
+                advc_log "ADVC broker rollover refused reason=proc-socket-state-unavailable"
+                return 1
+                ;;
+        esac
+        rm -f "$ADVC_PRODUCTION_SOCKET" || return 1
+    fi
+    rm -f "$ADVC_PID_FILE"
+    advc_log "ADVC broker retired pid=$old_pid old_sha=$old_sha new_sha=$active_sha"
+    advc_start_active
+}
+
+advc_cleanup() {
+    rm -f "$ADVC_CMDLINE_EXPECTED"
+}
+trap advc_cleanup EXIT HUP INT TERM
+
+exec 7<>"$ADVC_LOCK_FILE" || exit 1
+# Android mksh marks auxiliary descriptors close-on-exec. Duplicating the
+# descriptor onto stdin gives flock the same open file description retained by
+# this shell, so concurrent service hooks serialize through the whole rollover.
+flock -x 0 <&7 || exit 1
+advc_reconcile_locked
+result=$?
+flock -u 0 <&7
+exit "$result"

@@ -1,0 +1,9 @@
+id=sway
+name=Archcraft Sway Free - official public dotfiles
+family=wlroots-0.18
+compositor=sway
+install=public-packages
+composition=sway swaybg swayidle swaylock xorg-xwayland hyprpicker hyprlock wl-clipboard waybar wofi kanshi foot mako grim slurp wf-recorder light yad wlogout thunar geany mpv mpd mpc viewnior imagemagick xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk playerctl pastel python-pywal alacritty rofi pulsemixer
+debian_mappings=mako:mako-notifier,xorg-xwayland:xwayland,python-pywal:pywal16
+appearance=archcraft-official-public-dotfiles
+status=stable

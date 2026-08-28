@@ -1,0 +1,25 @@
+* text=auto
+*.c text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.map text eol=lf
+*.profile text eol=lf
+*.ps1 text eol=crlf
+*.tar.gz -text
+*.tar.xz -text
+
+# Prebuilt Android/AArch64 runtime files shipped by the module.
+module/bin/advc-broker -text
+module/bin/advc-capability-probe -text
+module/bin/drm_feature_probe -text
+module/bin/drm_lease_broker -text
+module/bin/drm_lease_client -text
+module/payload/bridge/**/bin/* -text
+module/payload/bridge/**/lib/* -text
+*.so -text
+*.so.1 -text

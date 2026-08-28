@@ -1,0 +1,92 @@
+From: JHoon <maintainer@lindex.invalid>
+Subject: [PATCH] vaapi: service decoded output from surface status polling
+
+GStreamer can poll vaQuerySurfaceStatus before it calls vaSyncSurface.  The
+ADVC decode runtime previously dequeued broker output only from sync and
+queue-backpressure paths, leaving short streams pending forever.  Perform a
+bounded nonblocking dequeue from the status query and keep a live probe that
+requires Ready before sync.
+
+---
+ src/vaapi_advc/advc_vaapi_decode_runtime.c    | 28 ++++++++++++++++++++
+ src/vaapi_advc/tests/decode_runtime_probe.c   | 15 ++++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/src/vaapi_advc/advc_vaapi_decode_runtime.c b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+--- a/src/vaapi_advc/advc_vaapi_decode_runtime.c
++++ b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+@@ -1464,16 +1464,44 @@ VAStatus advc_vaapi_decode_query_surface_status(
+     struct advc_vaapi_decode_runtime *runtime, VASurfaceID surface_id,
+     VASurfaceStatus *status) {
+     struct advc_vaapi_surface *surface;
++    struct advc_vaapi_context *context;
++    unsigned int context_index;
++    unsigned int drain_count;
+     if (runtime == NULL || status == NULL)
+         return VA_STATUS_ERROR_INVALID_PARAMETER;
+     pthread_mutex_lock(&runtime->mutex);
+     surface = get_surface(runtime, surface_id);
+     if (surface == NULL) {
+         pthread_mutex_unlock(&runtime->mutex);
+         return VA_STATUS_ERROR_INVALID_SURFACE;
+     }
++
++    /*
++     * GStreamer may poll vaQuerySurfaceStatus without first calling
++     * vaSyncSurface.  Dequeue is non-blocking, so service the broker here as
++     * well; otherwise a short stream can remain PENDING forever even though
++     * decoded output is already queued.  Drain at most the bounded surface
++     * count so this status query never becomes an unbounded wait.
++     */
++    if (surface->state == ADVC_SURFACE_PENDING &&
++        id_index(surface->owner_context, ADVC_VAAPI_TYPE_CONTEXT,
++                 ADVC_VAAPI_CONTEXT_SLOTS, &context_index) == 0 &&
++        runtime->contexts[context_index].used) {
++        context = &runtime->contexts[context_index];
++        for (drain_count = 0;
++             drain_count < ADVC_VAAPI_SURFACE_SLOTS &&
++             surface->state == ADVC_SURFACE_PENDING;
++             ++drain_count) {
++            int drained = drain_one_output(runtime, context);
++            if (drained <= 0) break;
++        }
++    }
++    if (surface->state == ADVC_SURFACE_ERROR) {
++        pthread_mutex_unlock(&runtime->mutex);
++        return VA_STATUS_ERROR_DECODING_ERROR;
++    }
+     *status = surface->state == ADVC_SURFACE_PENDING ? VASurfaceRendering :
+                                                        VASurfaceReady;
+     pthread_mutex_unlock(&runtime->mutex);
+     return VA_STATUS_SUCCESS;
+ }
+diff --git a/src/vaapi_advc/tests/decode_runtime_probe.c b/src/vaapi_advc/tests/decode_runtime_probe.c
+--- a/src/vaapi_advc/tests/decode_runtime_probe.c
++++ b/src/vaapi_advc/tests/decode_runtime_probe.c
+@@ -171,9 +171,24 @@ int main(int argc, char **argv) {
+             buffers[b] = VA_INVALID_ID;
+         }
+     }
++    {
++        VASurfaceStatus query_status = VASurfaceRendering;
++        for (i = 0; i < 5000 && query_status != VASurfaceReady; ++i) {
++            if (check_status("query-status", vtable.vaQuerySurfaceStatus(
++                                                  &context, surfaces[0],
++                                                  &query_status)) < 0)
++                goto terminate;
++            if (query_status != VASurfaceReady) usleep(1000);
++        }
++        if (query_status != VASurfaceReady) {
++            fprintf(stderr, "query-status timed out before vaSyncSurface\n");
++            goto terminate;
++        }
++        printf("decode-query-status-pass polls=%u\n", i);
++    }
+     if (check_status("sync", vtable.vaSyncSurface2(
+                                  &context, surfaces[0],
+                                  UINT64_C(5000000000))) < 0)
+         goto terminate;
+     memset(&prime, 0, sizeof(prime));
+     if (check_status("export", vtable.vaExportSurfaceHandle(
+-- 
+2.47.2

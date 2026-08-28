@@ -1,0 +1,34 @@
+#!/system/bin/sh
+# Enter the LinDeX Debian rootfs without installing a /system/bin overlay.
+set -eu
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+resolve_moddir
+load_config
+
+[ "$(id -u)" -eq 0 ] || {
+    echo 'bootdebian: KernelSU root is required' >&2
+    exit 77
+}
+[ -d "$ROOTFS" ] && [ ! -L "$ROOTFS" ] || {
+    echo "bootdebian: Debian rootfs is unavailable: $ROOTFS" >&2
+    exit 78
+}
+
+ensure_chroot_mounts
+
+if [ "$#" -eq 0 ]; then
+    if [ -x "$ROOTFS/bin/bash" ]; then
+        set -- /bin/bash -l
+    else
+        set -- /bin/sh -l
+    fi
+fi
+
+exec /system/bin/chroot "$ROOTFS" /usr/bin/env \
+    SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR=/run/user/0 \
+    "$@"

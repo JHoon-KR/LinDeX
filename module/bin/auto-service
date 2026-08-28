@@ -1,0 +1,249 @@
+#!/system/bin/sh
+# Minimal hotplug watcher for v3. It never toggles USB-C CC state or attempts
+# automatic link recovery; the phone WebUI remains the recovery control path.
+set -u
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+resolve_moddir
+
+AUTO_LOCK=$STATE/auto-service.lock
+AUTO_PID=$STATE/auto-service.pid
+exec 8<>"$AUTO_LOCK"
+flock -n 0 <&8 || exit 0
+printf '%s\n' "$$" > "$AUTO_PID"
+chmod 0600 "$AUTO_PID"
+
+cleanup_auto_service() {
+    trap - EXIT HUP INT TERM
+    recorded=$(cat "$AUTO_PID" 2>/dev/null)
+    [ "$recorded" = "$$" ] && rm -f "$AUTO_PID"
+}
+trap cleanup_auto_service EXIT
+trap 'exit 0' HUP INT TERM
+
+last_connected=unknown
+absent_samples=0
+present_samples=0
+next_attempt=0
+retry_delay=2
+log_event "AUTO watcher started pid=$$"
+
+ANDROID_VOLUME_LAST=$STATE/android-volume-last-nonzero
+ANDROID_MEDIA_CMD=${ANDROID_MEDIA_CMD:-/system/bin/cmd}
+ANDROID_MEDIA_TIMEOUT=${ANDROID_MEDIA_TIMEOUT:-/system/bin/timeout}
+
+configure_android_volume_bridge_paths() {
+    ANDROID_VOLUME_RUNTIME=$ROOTFS/run/android-drm
+    ANDROID_VOLUME_COMMANDS=$ANDROID_VOLUME_RUNTIME/android-volume-commands
+    ANDROID_VOLUME_STATE=$ANDROID_VOLUME_RUNTIME/android-volume.state
+}
+
+android_media_volume_command() {
+    "$ANDROID_MEDIA_TIMEOUT" 2 "$ANDROID_MEDIA_CMD" media_session volume "$@"
+}
+
+remember_nonzero_android_volume() {
+    volume_to_remember=$1
+    case "$volume_to_remember" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$volume_to_remember" -gt 0 ] || return 1
+    volume_previous=$(cat "$ANDROID_VOLUME_LAST" 2>/dev/null)
+    [ "$volume_previous" = "$volume_to_remember" ] && return 0
+    printf '%s\n' "$volume_to_remember" > "$ANDROID_VOLUME_LAST.tmp.$$" ||
+        return 1
+    chmod 0600 "$ANDROID_VOLUME_LAST.tmp.$$" 2>/dev/null || true
+    mv -f "$ANDROID_VOLUME_LAST.tmp.$$" "$ANDROID_VOLUME_LAST"
+}
+
+query_android_media_volume() {
+    volume_output=$(android_media_volume_command --get --stream 3 2>/dev/null) ||
+        return 1
+    volume_pair=$(printf '%s\n' "$volume_output" | sed -n \
+        's/.*volume is \([0-9][0-9]*\) in range \[0\.\.\([0-9][0-9]*\)\].*/\1 \2/p' |
+        sed -n '1p')
+    set -- $volume_pair
+    [ "$#" -eq 2 ] || return 1
+    case "$1:$2" in *[!0-9:]*) return 1 ;; esac
+    [ "$2" -gt 0 ] || return 1
+    ANDROID_VOLUME_CURRENT=$1
+    ANDROID_VOLUME_MAXIMUM=$2
+    return 0
+}
+
+publish_android_media_volume() {
+    query_android_media_volume || {
+        rm -f "$ANDROID_VOLUME_STATE"
+        return 1
+    }
+    [ "$ANDROID_VOLUME_CURRENT" -le "$ANDROID_VOLUME_MAXIMUM" ] || return 1
+    if [ "$ANDROID_VOLUME_CURRENT" -gt 0 ]; then
+        remember_nonzero_android_volume "$ANDROID_VOLUME_CURRENT" || true
+    fi
+    {
+        printf 'volume=%s\n' "$ANDROID_VOLUME_CURRENT"
+        printf 'maximum=%s\n' "$ANDROID_VOLUME_MAXIMUM"
+        printf 'updated=%s\n' "$(date +%s)"
+    } > "$ANDROID_VOLUME_STATE.tmp.$$"
+    chmod 0600 "$ANDROID_VOLUME_STATE.tmp.$$" 2>/dev/null || true
+    mv -f "$ANDROID_VOLUME_STATE.tmp.$$" "$ANDROID_VOLUME_STATE"
+}
+
+process_android_volume_commands() {
+    configure_android_volume_bridge_paths
+    [ -d "$ROOTFS/run" ] || return 0
+    mkdir -p "$ANDROID_VOLUME_RUNTIME" "$ANDROID_VOLUME_COMMANDS" || return 0
+    # Sway and Waybar run as the chroot's root user. Keep the shared broker
+    # runtime private instead of weakening its existing socket permissions.
+    chmod 0700 "$ANDROID_VOLUME_RUNTIME" "$ANDROID_VOLUME_COMMANDS" \
+        2>/dev/null || true
+    volume_commands_processed=0
+    for volume_command_file in "$ANDROID_VOLUME_COMMANDS"/*.cmd; do
+        [ "$volume_commands_processed" -lt 8 ] || break
+        if [ -L "$volume_command_file" ]; then
+            rm -f "$volume_command_file"
+            continue
+        fi
+        [ -f "$volume_command_file" ] || continue
+        volume_command_bytes=$(wc -c < "$volume_command_file" 2>/dev/null |
+            tr -d ' ')
+        case "$volume_command_bytes" in
+            ''|*[!0-9]*) rm -f "$volume_command_file"; continue ;;
+        esac
+        if [ "$volume_command_bytes" -gt 16 ]; then
+            rm -f "$volume_command_file"
+            continue
+        fi
+        volume_action=$(cat "$volume_command_file" 2>/dev/null)
+        rm -f "$volume_command_file"
+        volume_commands_processed=$((volume_commands_processed + 1))
+        case "$volume_action" in
+            raise|lower)
+                android_media_volume_command --stream 3 \
+                    --adj "$volume_action" >/dev/null 2>&1 || true
+                ;;
+            toggle)
+                if query_android_media_volume; then
+                    if [ "$ANDROID_VOLUME_CURRENT" -gt 0 ]; then
+                        remember_nonzero_android_volume \
+                            "$ANDROID_VOLUME_CURRENT" || true
+                        android_media_volume_command --stream 3 \
+                            --set 0 >/dev/null 2>&1 || true
+                    else
+                        volume_restore=$(sed -n '1p' "$ANDROID_VOLUME_LAST" 2>/dev/null)
+                        case "$volume_restore" in
+                            ''|*[!0-9]*) volume_restore=1 ;;
+                        esac
+                        [ "$volume_restore" -gt 0 ] || volume_restore=1
+                        [ "$volume_restore" -le "$ANDROID_VOLUME_MAXIMUM" ] ||
+                            volume_restore=$ANDROID_VOLUME_MAXIMUM
+                        android_media_volume_command --stream 3 \
+                            --set "$volume_restore" >/dev/null 2>&1 || true
+                    fi
+                fi
+                ;;
+        esac
+    done
+    publish_android_media_volume || true
+}
+
+# Reconcile the Android hardware-codec broker once at service start.  The
+# helper mounts only missing chroot filesystems and refuses to expose the
+# broker unless the packaged VA driver, proc/sys DRM identity and production
+# socket are all present. This never touches the live display.
+load_config
+if [ "$VIDEO_ACCELERATION" = auto ]; then
+    prepare_advc_codec_runtime || log_event \
+        'ADVC codec unavailable; VA-API advertisement remains disabled'
+fi
+
+while :; do
+    load_config
+    process_android_volume_commands
+    now=$(date +%s)
+    if physical_dp_path >/dev/null 2>&1; then connected=1; else connected=0; fi
+    if connected_dp_path >/dev/null 2>&1; then raw_connected=1; else raw_connected=0; fi
+
+    if [ "$connected" != "$last_connected" ]; then
+        log_event "DP physical-edid state=$connected"
+        last_connected=$connected
+    fi
+
+    start_intent_active=0
+    if session_start_intent_active "$now"; then
+        start_intent_active=1
+    elif [ -e "$STATE/session-start.intent" ]; then
+        # Invalid, expired or dead-owner markers never suppress unplug cleanup.
+        rm -f "$STATE/session-start.intent"
+    fi
+    start_intent_grace=0
+    if [ "$start_intent_active" = 1 ] &&
+       { [ "$raw_connected" = 1 ] || typec_partner_present; }; then
+        # DisplayManager may transiently hide DP status/EDID while the same
+        # physical Type-C partner remains attached. A true cable removal has
+        # neither raw connector state nor a partner and must never use this
+        # startup exemption.
+        start_intent_grace=1
+    fi
+
+    if [ -f "$STATE/retrigger" ]; then
+        rm -f "$STATE/retrigger"
+        rm -f "$STATE/manual_stop"
+        next_attempt=0
+        retry_delay=2
+    fi
+
+    if [ "$connected" = 1 ]; then
+        absent_samples=0
+        present_samples=$((present_samples + 1))
+        if [ "$AUTO_ATTACH" = 1 ] && ! session_running &&
+           [ ! -f "$STATE/manual_stop" ] && [ "$now" -ge "$next_attempt" ] &&
+           [ "$present_samples" -ge 2 ] &&
+           profile_installed "$PROFILE" && bridge_runtime_ready; then
+            log_event "AUTO start profile=$PROFILE"
+            start_desktop
+            start_rc=$?
+            write_state_value "$STATE/last_start_status" "$start_rc" || true
+            next_attempt=$((now + retry_delay))
+            retry_delay=$((retry_delay * 2))
+            [ "$retry_delay" -le 30 ] || retry_delay=30
+        fi
+    else
+        present_samples=0
+        if [ "$start_intent_grace" = 1 ]; then
+            # DisplayManager's intentional pre-detach can briefly remove DP
+            # status/EDID before the lease broker owns the connector.
+            absent_samples=0
+        else
+            absent_samples=$((absent_samples + 1))
+            # A connector that explicitly reports disconnected is a hard
+            # unplug: stop on the first watcher sample so no compositor can
+            # race Android's internal display.  Keep a two-sample debounce only
+            # for a connected link whose EDID is temporarily unreadable.
+            stop_threshold=2
+            [ "$raw_connected" = 1 ] || stop_threshold=1
+            if [ "$absent_samples" -ge "$stop_threshold" ]; then
+                if session_running || recorded_session_group_running; then
+                    stop_desktop
+                elif [ "$(cat "$STATE/session-state" 2>/dev/null)" != stopped ] ||
+                     [ -e "$PIDFILE" ] || [ -e "$STATE/session.pgid" ] ||
+                     [ -e "$STATE/session-start.intent" ]; then
+                    # A KernelSU soft restart or an earlier diagnostic may
+                    # leave only stale state after every owned process is
+                    # already gone.  Reconcile markers and the WebUI state
+                    # without signalling unrelated processes.
+                    rm -f "$PIDFILE" "$STATE/session.pgid" \
+                        "$STATE/session-start.intent"
+                    write_state_value "$STATE/session-state" stopped
+                fi
+                rm -f "$STATE/manual_stop"
+                next_attempt=0
+                retry_delay=2
+            fi
+        fi
+    fi
+
+    session_running || rm -f "$PIDFILE"
+    maintain_logs
+    sleep 1
+done

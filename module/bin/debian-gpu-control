@@ -1,0 +1,332 @@
+#!/system/bin/sh
+set -u
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+resolve_moddir
+load_config
+
+write_config() {
+    config_tmp=$CONFIG.tmp.$$
+    {
+        echo "AUTO_ATTACH=$AUTO_ATTACH"
+        echo "PROFILE=$PROFILE"
+        echo "SWAY_THEME=$SWAY_THEME"
+        echo "MESA_MODE=$MESA_MODE"
+        echo "DISPLAY_MODE=$DISPLAY_MODE"
+        echo "MODE_POLICY=$MODE_POLICY"
+        echo "OUTPUT_MODIFIER_POLICY=$OUTPUT_MODIFIER_POLICY"
+        echo "DIRECT_SCANOUT=$DIRECT_SCANOUT"
+        echo "ALLOW_XWAYLAND=$ALLOW_XWAYLAND"
+        echo "SHARE_TOUCH=$SHARE_TOUCH"
+        echo "USB_INPUT_MODE=$USB_INPUT_MODE"
+        echo "VIDEO_ACCELERATION=$VIDEO_ACCELERATION"
+        echo "RESTORE_ANDROID=$RESTORE_ANDROID"
+        echo "ROOTFS=$ROOTFS"
+        echo "SESSION_SECONDS=$SESSION_SECONDS"
+    } > "$config_tmp" || return 1
+    chmod 0600 "$config_tmp"
+    mv -f "$config_tmp" "$CONFIG"
+}
+
+run_bounded_setup() {
+    setup_limit=${START_PREPARE_TIMEOUT_SECONDS:-7200}
+    case "$setup_limit" in ''|*[!0-9]*) return 2 ;; esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -s TERM "$setup_limit" "$MODDIR/bin/setup-debian-gpu" "$@"
+    elif [ -x /system/bin/toybox ]; then
+        /system/bin/toybox timeout -s TERM "$setup_limit" "$MODDIR/bin/setup-debian-gpu" "$@"
+    else
+        echo 'setup requires timeout support' >&2
+        return 69
+    fi
+}
+
+emit_display_mode_file() {
+    cat "$1"
+}
+
+display_modes() {
+    cache=$STATE/display-modes.cache
+    tmp_ids=/data/local/tmp/debian-profile-display-ids.$$
+    tmp_supported=/data/local/tmp/debian-profile-display-modes.$$
+    tmp_active=/data/local/tmp/debian-profile-display-active.$$
+    tmp_output=$cache.tmp.$$
+    dp_path=$(physical_dp_path 2>/dev/null) || { [ -r "$cache" ] && cat "$cache"; return 0; }
+    rm -f "$tmp_ids" "$tmp_supported" "$tmp_active" "$tmp_output"
+    trap 'rm -f "$tmp_ids" "$tmp_supported" "$tmp_active" "$tmp_output"' EXIT HUP INT TERM
+    /system/bin/su 2000 -c "/system/bin/cmd display get-displays --ids-only --type external >$tmp_ids 2>&1 </dev/null" || true
+    ids=$(cat "$tmp_ids" 2>/dev/null)
+    set -- $ids
+    if [ "$#" -eq 1 ]; then
+        display_id=$1
+        case "$display_id" in
+            ''|*[!0-9]*) display_id= ;;
+        esac
+    else
+        display_id=
+    fi
+    if [ -n "$display_id" ]; then
+        /system/bin/su 2000 -c "/system/bin/cmd display get-supported-modes $display_id >$tmp_supported 2>&1 </dev/null" || true
+        /system/bin/su 2000 -c "/system/bin/cmd display get-active-mode $display_id >$tmp_active 2>&1 </dev/null" || true
+    fi
+    {
+        echo "CONNECTOR=${dp_path##*/}"
+        edid_sha=$(sha256sum "$dp_path/edid" 2>/dev/null | awk '{print $1}')
+        [ -n "$edid_sha" ] && echo "EDID_SHA=$edid_sha"
+        awk '/Resolution:/ {
+            resolution=$0; sub(/^.*Resolution: */, "", resolution); sub(/,.*/, "", resolution)
+            refresh=$0; sub(/^.*Refresh Rate: */, "", refresh); sub(/ *Hz.*/, "", refresh); gsub(/ /, "", refresh)
+            if (resolution ~ /^[0-9]+x[0-9]+$/ && refresh ~ /^[0-9.]+$/) {
+                printf "CURRENT=%s@%.2f\n", resolution, refresh + 0; exit
+            }
+        }' "$tmp_active" 2>/dev/null
+        awk 'NR == FNR { valid[$1]=1; next }
+            /Resolution:/ {
+                resolution=$0; sub(/^.*Resolution: */, "", resolution); sub(/,.*/, "", resolution)
+                refresh=$0; sub(/^.*Refresh Rate: */, "", refresh); sub(/ *Hz.*/, "", refresh); gsub(/ /, "", refresh)
+                if (valid[resolution] && refresh ~ /^[0-9.]+$/) {
+                    mode=sprintf("%s@%.2f", resolution, refresh + 0)
+                    if (!seen[mode]++) print "MODE=" mode
+                }
+            }' "$dp_path/modes" "$tmp_supported" 2>/dev/null
+        # Explicit custom candidates requested by the user. They are never
+        # selected automatically and have no automatic rollback.
+        awk '
+            NR == FNR {
+                if ($0 ~ /Resolution:/) {
+                    resolution=$0; sub(/^.*Resolution: */, "", resolution); sub(/,.*/, "", resolution)
+                    refresh=$0; sub(/^.*Refresh Rate: */, "", refresh); sub(/ *Hz.*/, "", refresh); gsub(/ /, "", refresh)
+                    if (resolution ~ /^[0-9]+x[0-9]+$/ && refresh ~ /^[0-9.]+$/) {
+                        for (target=100; target<=120; target+=20)
+                            if ((refresh + 0) > target - 0.75 && (refresh + 0) < target + 0.75)
+                                actual[resolution, target]=1
+                        if ((refresh + 0) > 143.25 && (refresh + 0) < 144.75)
+                            actual[resolution, 144]=1
+                    }
+                }
+                next
+            }
+            /^[0-9]+x[0-9]+$/ && !seen[$0]++ { resolution[++count]=$0 }
+            END {
+                for (i=1; i<=count; i++) {
+                    if (!actual[resolution[i], 100]) printf "EXPERIMENTAL_MODE=%s@100.00\n", resolution[i]
+                    if (!actual[resolution[i], 120]) printf "EXPERIMENTAL_MODE=%s@120.00\n", resolution[i]
+                    if (!actual[resolution[i], 144]) printf "EXPERIMENTAL_MODE=%s@144.00\n", resolution[i]
+                }
+            }' "$tmp_supported" "$dp_path/modes" 2>/dev/null
+    } > "$tmp_output"
+    if grep -q '^MODE=' "$tmp_output"; then
+        mv -f "$tmp_output" "$cache"
+    else
+        rm -f "$tmp_output"
+    fi
+    trap - EXIT HUP INT TERM
+    rm -f "$tmp_ids" "$tmp_supported" "$tmp_active" "$tmp_output"
+    [ -r "$cache" ] && emit_display_mode_file "$cache"
+}
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
+}
+
+status_json() {
+    if hardware_check; then hardware=ready; else hardware=blocked; fi
+    raw_dp=$(dp_connector_path 2>/dev/null)
+    if dp=$(physical_dp_path 2>/dev/null); then
+        dp_state=connected
+        edid_state=ready
+    elif [ -n "$raw_dp" ] && [ "$(cat "$raw_dp/status" 2>/dev/null)" = connected ]; then
+        dp_state=connected
+        edid_state=missing
+        dp=$raw_dp
+    elif typec_partner_present; then
+        dp_state=adapter
+        edid_state=waiting
+        dp=${raw_dp:-none}
+    else
+        dp_state=disconnected
+        edid_state=disconnected
+        dp=${raw_dp:-none}
+    fi
+    if session_running; then running=true; pid=$(cat "$PIDFILE"); else running=false; pid=0; fi
+    setup_pid=$(cat "$STATE/setup.pid" 2>/dev/null)
+    if valid_pid "$setup_pid" && kill -0 "$setup_pid" 2>/dev/null; then setup_running=true; else setup_running=false; fi
+    if profile_installed "$PROFILE"; then profile_installed_json=true; else profile_installed_json=false; fi
+    if bridge_runtime_ready; then bridge_ready=true; else bridge_ready=false; fi
+    prep_state=$(cat "$STATE/start-prepare-state" 2>/dev/null); [ -n "$prep_state" ] || prep_state=idle
+    prep_detail=$(cat "$STATE/start-prepare-detail" 2>/dev/null); [ -n "$prep_detail" ] || prep_detail=ready
+    last_error=$(cat "$STATE/last-error" 2>/dev/null); [ -n "$last_error" ] || last_error=none
+    progress_file=$ROOTFS/var/lib/android-drm-lease-kit/setup-progress
+    install_percent=0
+    install_stage=not-installed
+    install_detail=profile-not-installed
+    if [ -r "$progress_file" ] &&
+       [ "$(sed -n 's/^profile=//p' "$progress_file" 2>/dev/null)" = "$PROFILE" ]; then
+        candidate_percent=$(sed -n 's/^percent=//p' "$progress_file" 2>/dev/null)
+        case "$candidate_percent" in
+            ''|*[!0-9]*) ;;
+            *) [ "$candidate_percent" -le 100 ] && install_percent=$candidate_percent ;;
+        esac
+        candidate_stage=$(sed -n 's/^stage=//p' "$progress_file" 2>/dev/null)
+        candidate_detail=$(sed -n 's/^detail=//p' "$progress_file" 2>/dev/null)
+        [ -z "$candidate_stage" ] || install_stage=$candidate_stage
+        [ -z "$candidate_detail" ] || install_detail=$candidate_detail
+    fi
+    if [ "$setup_running" = false ]; then
+        if [ "$profile_installed_json" = true ] && [ "$bridge_ready" = true ]; then
+            install_percent=100
+            install_stage=complete
+            install_detail=profile-and-mesa-ready
+        elif [ "$prep_state" = failed ]; then
+            install_stage=failed
+            install_detail=$prep_detail
+        fi
+    fi
+    printf '{"hardware":"%s","dp":"%s","dpPath":"%s","edidState":"%s","running":%s,"pid":%s,"setupRunning":%s,"preparationState":"%s","preparationDetail":"%s","installPercent":%s,"installStage":"%s","installDetail":"%s","lastError":"%s","autoAttach":%s,"profile":"%s","profileInstalled":%s,"swayTheme":"%s","mesaMode":"%s","displayMode":"%s","modePolicy":"%s","outputPolicy":"%s","directScanout":"%s","xwayland":%s,"shareTouch":%s,"usbInputMode":"%s","videoAcceleration":"%s","bridgeReady":%s,"buildFlavor":"%s","logsEnabled":%s,"rootfs":"%s"}\n' \
+        "$hardware" "$dp_state" "$(json_escape "$dp")" "$edid_state" "$running" "$pid" \
+        "$setup_running" "$(json_escape "$prep_state")" "$(json_escape "$prep_detail")" \
+        "$install_percent" "$(json_escape "$install_stage")" "$(json_escape "$install_detail")" \
+        "$(json_escape "$last_error")" "$AUTO_ATTACH" "$PROFILE" "$profile_installed_json" "$SWAY_THEME" \
+        "$MESA_MODE" "$DISPLAY_MODE" "$MODE_POLICY" "$OUTPUT_MODIFIER_POLICY" "$DIRECT_SCANOUT" "$ALLOW_XWAYLAND" "$SHARE_TOUCH" \
+        "$USB_INPUT_MODE" "$VIDEO_ACCELERATION" \
+        "$bridge_ready" "$BUILD_FLAVOR" "$([ "$BUILD_FLAVOR" = dev ] && echo true || echo false)" \
+        "$(json_escape "$ROOTFS")"
+}
+
+quick_start_worker() {
+    write_state_value "$STATE/start-prepare-state" checking
+    write_state_value "$STATE/start-prepare-detail" profile-and-mesa
+    rm -f "$STATE/last-error"
+    setup_rc=0
+    run_bounded_setup --profile "$PROFILE" --mesa "$MESA_MODE" || setup_rc=$?
+    if [ "$setup_rc" -ne 0 ]; then
+        case "$setup_rc" in
+            65) failure_detail=profile-runtime-missing ;;
+            66) failure_detail=profile-runtime-verification-failed ;;
+            67) failure_detail=profile-dependency-required ;;
+            68) failure_detail=profile-installation-failed ;;
+            69|124|143) failure_detail=profile-setup-timeout ;;
+            70) failure_detail=profile-unavailable-in-release ;;
+            *) failure_detail=installation-failed ;;
+        esac
+        write_state_value "$STATE/start-prepare-state" failed
+        write_state_value "$STATE/start-prepare-detail" "$failure_detail"
+        write_state_value "$STATE/last-error" "$failure_detail:$setup_rc"
+        rm -f "$STATE/setup.pid"
+        return "$setup_rc"
+    fi
+    if ! profile_installed "$PROFILE" || ! bridge_runtime_ready; then
+        write_state_value "$STATE/start-prepare-state" failed
+        write_state_value "$STATE/start-prepare-detail" verification-failed
+        write_state_value "$STATE/last-error" profile-verification
+        rm -f "$STATE/setup.pid"
+        return 70
+    fi
+    if ! physical_dp_path >/dev/null 2>&1; then
+        write_state_value "$STATE/start-prepare-state" ready-waiting-dp
+        write_state_value "$STATE/start-prepare-detail" connect-external-display
+        rm -f "$STATE/setup.pid"
+        touch "$STATE/retrigger"
+        return 0
+    fi
+    write_state_value "$STATE/start-prepare-state" starting
+    write_state_value "$STATE/start-prepare-detail" stock-bridge-session
+    start_desktop
+    start_rc=$?
+    if [ "$start_rc" -eq 0 ]; then
+        write_state_value "$STATE/start-prepare-state" complete
+        write_state_value "$STATE/start-prepare-detail" session-started
+    else
+        write_state_value "$STATE/start-prepare-state" failed
+        write_state_value "$STATE/start-prepare-detail" start-refused
+        write_state_value "$STATE/last-error" "start-$start_rc"
+    fi
+    rm -f "$STATE/setup.pid"
+    return "$start_rc"
+}
+
+case "${1:-}" in
+    status-json) status_json ;;
+    status) status_json ;;
+    profiles)
+        for file in "$MODDIR"/profiles/*.profile; do
+            [ -r "$file" ] || continue
+            cat "$file"
+            echo
+        done
+        ;;
+    display-modes) display_modes ;;
+    set)
+        key=${2:-}; value=${3:-}
+        case "$key:$value" in
+            profile:*) profile_valid "$value" || { echo 'invalid profile' >&2; exit 2; }; PROFILE=$value ;;
+            sway_theme:dark|sway_theme:light|sway_theme:pywal) SWAY_THEME=$value ;;
+            mesa:standard) MESA_MODE=turnip ;;
+            mesa:turnip|mesa:turnip-unpatched|mesa:system) MESA_MODE=$value ;;
+            auto_attach:0|auto_attach:1) AUTO_ATTACH=$value ;;
+            xwayland:0|xwayland:1) ALLOW_XWAYLAND=$value ;;
+            share_touch:0|share_touch:1) SHARE_TOUCH=$value ;;
+            usb_input:shared|usb_input:linux-exclusive) USB_INPUT_MODE=$value ;;
+            video_acceleration:auto|video_acceleration:disabled) VIDEO_ACCELERATION=$value ;;
+            output_modifiers:auto|output_modifiers:linear|output_modifiers:ubwc) OUTPUT_MODIFIER_POLICY=$value ;;
+            direct_scanout:auto|direct_scanout:off) DIRECT_SCANOUT=$value ;;
+            mode_policy:preferred|mode_policy:highest-refresh|mode_policy:preserve) MODE_POLICY=$value ;;
+            display_mode:auto) DISPLAY_MODE=auto ;;
+            display_mode:[0-9]*x[0-9]*@[0-9]*)
+                display_modes | grep -Eq "^(MODE|EXPERIMENTAL_MODE)=$value$" || { echo 'mode is not available for the connected display' >&2; exit 2; }
+                DISPLAY_MODE=$value
+                ;;
+            *) echo 'invalid setting' >&2; exit 2 ;;
+        esac
+        write_config
+        touch "$STATE/retrigger"
+        status_json
+        ;;
+    start-ready-async)
+        if session_running; then echo 'session already running'; exit 0; fi
+        setup_pid=$(cat "$STATE/setup.pid" 2>/dev/null)
+        if valid_pid "$setup_pid" && kill -0 "$setup_pid" 2>/dev/null; then
+            echo 'INSTALLATION_IN_PROGRESS' >&2
+            exit 75
+        fi
+        maintain_logs
+        if [ "$BUILD_FLAVOR" = dev ]; then
+            quick_start_worker >> "$SETUP_LOG" 2>&1 &
+        else
+            quick_start_worker >/dev/null 2>&1 &
+        fi
+        printf '%s\n' "$!" > "$STATE/setup.pid"
+        chmod 0600 "$STATE/setup.pid"
+        echo "profile preparation accepted pid=$!"
+        ;;
+    start)
+        start_desktop
+        ;;
+    stop)
+        touch "$STATE/manual_stop"
+        stop_desktop
+        ;;
+    restart)
+        stop_desktop
+        sleep 1
+        start_desktop
+        ;;
+    dev-log)
+        [ "$BUILD_FLAVOR" = dev ] || { echo 'diagnostic logs are disabled in release builds'; exit 0; }
+        tail -n "${2:-240}" "$SETUP_LOG" "$LOGFILE" 2>/dev/null || true
+        ;;
+    clear-dev-logs)
+        [ "$BUILD_FLAVOR" = dev ] || exit 0
+        : > "$SETUP_LOG"
+        : > "$LOGFILE"
+        : > "$STATE/advc-broker.log"
+        rm -f "$STATE/setup.previous.log" "$STATE/session.previous.log" \
+            "$STATE/advc-broker.previous.log"
+        ;;
+    *)
+        echo 'usage: debian-gpu-control status-json|profiles|display-modes|set KEY VALUE|start-ready-async|start|stop|restart|dev-log|clear-dev-logs'
+        exit 2
+        ;;
+esac

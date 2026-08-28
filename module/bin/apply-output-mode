@@ -1,0 +1,74 @@
+#!/system/bin/sh
+
+MODE=${1:-auto}
+ROOTFS=${2:-/data/local/debian}
+EXPERIMENTAL=${3:-0}
+
+case "$MODE" in
+    auto) ;;
+    [0-9]*x[0-9]*@[0-9]*) ;;
+    *) echo "OUTPUT MODE: invalid request '$MODE'"; exit 2 ;;
+esac
+case "$ROOTFS" in /*) ;; *) exit 2 ;; esac
+
+count=0
+while [ "$count" -lt 80 ]; do
+    for socket in "$ROOTFS"/run/user/0/wayland-*; do
+        [ -S "$socket" ] || continue
+        wayland_display=${socket##*/}
+        listing=$(chroot "$ROOTFS" /usr/bin/env \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY="$wayland_display" \
+            /usr/bin/wlr-randr 2>/dev/null) || continue
+        output_name=$(printf '%s\n' "$listing" | awk 'NR == 1 { print $1; exit }')
+        case "$output_name" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
+
+        if [ "$MODE" = auto ]; then
+            if chroot "$ROOTFS" /usr/bin/env \
+                PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY="$wayland_display" \
+                /usr/bin/wlr-randr --output "$output_name" --preferred; then
+                echo "OUTPUT MODE: monitor preferred mode applied output=$output_name"
+                exit 0
+            fi
+            continue
+        fi
+
+        resolution=${MODE%@*}
+        requested_hz=${MODE#*@}
+        actual_hz=$(printf '%s\n' "$listing" | awk -v resolution="$resolution" -v requested="$requested_hz" '
+            $1 == resolution && $2 == "px," && $4 == "Hz" {
+                difference = $3 - requested
+                if (difference < 0) difference = -difference
+                if (!found || difference < closest) {
+                    found = 1; closest = difference; refresh = $3
+                }
+            }
+            END { if (found && closest <= 0.75) print refresh }
+        ')
+        if [ -n "$actual_hz" ]; then
+            exact_mode="${resolution}@${actual_hz}Hz"
+            if chroot "$ROOTFS" /usr/bin/env \
+                PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY="$wayland_display" \
+                /usr/bin/wlr-randr --output "$output_name" --mode "$exact_mode"; then
+                echo "OUTPUT MODE: applied requested=$MODE exact=$exact_mode output=$output_name"
+                exit 0
+            fi
+        elif [ "$EXPERIMENTAL" = 1 ]; then
+            custom_mode="${resolution}@${requested_hz}Hz"
+            if chroot "$ROOTFS" /usr/bin/env \
+                PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY="$wayland_display" \
+                /usr/bin/wlr-randr --output "$output_name" --custom-mode "$custom_mode"; then
+                echo "OUTPUT MODE: experimental custom mode applied request=$MODE exact=$custom_mode output=$output_name automatic-rollback=disabled"
+                exit 0
+            fi
+        fi
+    done
+    sleep 0.25
+    count=$((count + 1))
+done
+
+echo "OUTPUT MODE: unavailable request=$MODE experimental=$EXPERIMENTAL"
+exit 1

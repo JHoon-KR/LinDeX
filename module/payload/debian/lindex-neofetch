@@ -1,0 +1,28 @@
+#!/bin/sh
+# LinDeX Neofetch wrapper. The pinned upstream program remains a separate file.
+set -eu
+
+real=${LINDEX_NEOFETCH_REAL:-/usr/local/libexec/android-drm/neofetch-7.1.0}
+config=${LINDEX_NEOFETCH_CONFIG:-/usr/local/share/android-drm/neofetch.conf}
+
+[ -x "$real" ] || {
+    echo "LinDeX Neofetch runtime is missing: $real" >&2
+    exit 127
+}
+[ -r "$config" ] || {
+    echo "LinDeX Neofetch hardware adapter is missing: $config" >&2
+    exit 127
+}
+
+explicit_config=0
+for argument in "$@"; do
+    case $argument in
+        --config|--no_config) explicit_config=1 ;;
+    esac
+done
+export LINDEX_NEOFETCH_EXPLICIT_CONFIG=$explicit_config
+
+# Load the adapter before command-line flags so Neofetch keeps its usual
+# config-then-arguments precedence. An explicit user config that follows may
+# still replace any detector deliberately.
+exec "$real" --config "$config" "$@"

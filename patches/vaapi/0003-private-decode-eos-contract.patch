@@ -1,0 +1,1581 @@
+From: LinDeX maintainers <noreply@localhost>
+Subject: [PATCH] vaapi: add private opt-in decode EOS contract
+
+This is a private, exact-opt-in integration contract. Unmodified FFmpeg and
+GStreamer VA-API clients do not resolve or call its private symbol, so this
+patch does not complete stock-application decode EOS support.
+
+The default session clears the opt-in environment variable, and generic
+VA-API behavior remains unchanged until a validated caller explicitly opts in.
+
+---diff --git a/module/bin/stock-profile-session b/module/bin/stock-profile-session
+index 3570ff7..b9152e8 100644
+--- a/module/bin/stock-profile-session
++++ b/module/bin/stock-profile-session
+@@ -67,6 +67,7 @@ unset ADVC_VAAPI_ENABLE_AVC ADVC_VAAPI_ENABLE_ENCODE ADVC_VAAPI_QCOM_IMPORT
+ unset ADVC_VAAPI_ENABLE_HEVC ADVC_VAAPI_ENABLE_VP9
+ unset ADVC_VAAPI_GPU_LINEAR_REPACK ADVC_VAAPI_OUTPUT
+ unset ADVC_VAAPI_ENABLE_WRITE_EXPORT ADVC_VAAPI_ENABLE_GENERIC_UPLOAD
++unset ADVC_VAAPI_ENABLE_PRIVATE_DECODE_EOS
+ unset ADVC_VAAPI_ALLOW_CPU_COPY ADVC_VAAPI_TRACE
+ 
+ # Export ADVC only when the outer launcher has completed the fail-closed
+diff --git a/scripts/test-video-acceleration-module.sh b/scripts/test-video-acceleration-module.sh
+index e3be516..074a42c 100644
+--- a/scripts/test-video-acceleration-module.sh
++++ b/scripts/test-video-acceleration-module.sh
+@@ -62,11 +62,15 @@ require_text 'GST_REGISTRY_FORK=no' "$SESSION"
+ require_text 'GST_REGISTRY=$XDG_RUNTIME_DIR/lindex-gstreamer-advc-v1.bin' "$SESSION"
+ require_text 'unset GST_VAAPI_DRM_DEVICE GST_VAAPI_ALL_DRIVERS GST_REGISTRY_FORK GST_REGISTRY' "$SESSION"
+ require_text 'unset ADVC_VAAPI_ENABLE_WRITE_EXPORT ADVC_VAAPI_ENABLE_GENERIC_UPLOAD' "$SESSION"
++require_text 'unset ADVC_VAAPI_ENABLE_PRIVATE_DECODE_EOS' "$SESSION"
+ require_text 'unset ADVC_VAAPI_ENABLE_HEVC ADVC_VAAPI_ENABLE_VP9' "$SESSION"
+ require_text 'unset ADVC_VAAPI_GPU_LINEAR_REPACK ADVC_VAAPI_OUTPUT' "$SESSION"
+ require_text '[ -e /proc/self/fd ]' "$SESSION"
+ require_text '[ -d /sys/class/drm/renderD128 ]' "$SESSION"
+ require_text 'sha256sum -c SHA256SUMS' "$SESSION"
++if grep -Fq 'export ADVC_VAAPI_ENABLE_PRIVATE_DECODE_EOS=' "$SESSION"; then
++    fail 'private decode EOS must not be exported by the stock session'
++fi
+ require_text 'gstreamer1.0-vaapi' "$INSTALL"
+ require_text 'gstreamer1.0-plugins-bad' "$INSTALL"
+ require_text 'gstreamer1.0-tools' "$INSTALL"
+diff --git a/src/vaapi_advc/CMakeLists.txt b/src/vaapi_advc/CMakeLists.txt
+index ad16ee1..cf15eca 100644
+--- a/src/vaapi_advc/CMakeLists.txt
++++ b/src/vaapi_advc/CMakeLists.txt
+@@ -56,6 +56,22 @@ target_compile_options(advc_vaapi_surface_policy PRIVATE
+     -Wall -Wextra -Wpedantic -Werror)
+ 
+ enable_testing()
++add_library(advc_vaapi_decode_eos STATIC advc_vaapi_decode_eos.c)
++set_target_properties(advc_vaapi_decode_eos PROPERTIES
++    POSITION_INDEPENDENT_CODE ON)
++target_include_directories(advc_vaapi_decode_eos PUBLIC
++    "${CMAKE_CURRENT_SOURCE_DIR}")
++target_compile_options(advc_vaapi_decode_eos PRIVATE
++    -Wall -Wextra -Wpedantic -Werror)
++
++add_executable(advc_vaapi_decode_eos_test tests/decode_eos_test.c)
++target_link_libraries(advc_vaapi_decode_eos_test PRIVATE
++    advc_vaapi_decode_eos)
++target_compile_options(advc_vaapi_decode_eos_test PRIVATE
++    -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
++add_test(NAME advc_vaapi_decode_eos
++    COMMAND advc_vaapi_decode_eos_test)
++
+ add_executable(advc_vaapi_policy_test tests/policy_test.c)
+ target_link_libraries(advc_vaapi_policy_test PRIVATE advc_vaapi_policy)
+ target_compile_options(advc_vaapi_policy_test PRIVATE
+@@ -215,7 +231,7 @@ if(ADVC_BUILD_VAAPI_DRIVER)
+     target_link_libraries(advc_drv_video PRIVATE
+         advc_vaapi_policy advc_h264_annexb advc_vaapi_decode_hevc
+         advc_vaapi_decode_vp9 advc_vaapi_slice_layout
+-        advc_vaapi_surface_policy
++        advc_vaapi_surface_policy advc_vaapi_decode_eos
+         advc_vaapi_encode_runtime advc_vaapi_image advc_vaapi_encode
+         advc_protocol_for_vaapi
+         Threads::Threads Vulkan::Vulkan)
+diff --git a/src/vaapi_advc/advc_drv_video.c b/src/vaapi_advc/advc_drv_video.c
+index 04ade8f..3413620 100644
+--- a/src/vaapi_advc/advc_drv_video.c
++++ b/src/vaapi_advc/advc_drv_video.c
+@@ -1,5 +1,6 @@
+ #include "advc_vaapi_policy.h"
+ #include "advc_vaapi_decode_runtime.h"
++#include "advc_vaapi_decode_eos_private.h"
+ #include "advc_vaapi_encode_runtime.h"
+ 
+ #include "advc/client.h"
+@@ -911,6 +912,83 @@ static void install_vtable(struct VADriverVTable *vtable) {
+     vtable->vaSyncBuffer = advc_sync_buffer;
+ }
+ 
++static VADriverContextP driver_context_from_display(VADisplay display) {
++    VADisplayContextP display_context = (VADisplayContextP)display;
++    if (display_context == NULL ||
++        display_context->vadpy_magic != VA_DISPLAY_MAGIC ||
++        display_context->pDriverContext == NULL)
++        return NULL;
++    return display_context->pDriverContext;
++}
++
++static int32_t private_eos_invalid_display_status(
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    uint32_t caller_size;
++    if (status == NULL || status->struct_size < sizeof(*status))
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    caller_size = status->struct_size;
++    memset(status, 0, sizeof(*status));
++    status->struct_size = caller_size;
++    status->abi_version = ADVC_VAAPI_DECODE_EOS_ABI_VERSION;
++    status->phase = ADVC_VAAPI_DECODE_EOS_FAILED;
++    status->flags = ADVC_VAAPI_DECODE_EOS_STATUS_FAILED;
++    status->last_result = ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT;
++    return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT;
++}
++
++static int32_t private_decode_eos_signal(
++    VADisplay display, VAContextID context_id, uint32_t flags,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    VADriverContextP driver_context;
++    struct advc_vaapi_driver *driver;
++    if (flags != 0)
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    driver_context = driver_context_from_display(display);
++    driver = driver_from_context(driver_context);
++    if (driver == NULL) return private_eos_invalid_display_status(status);
++    return advc_vaapi_decode_signal_eos_private(driver->decode, context_id,
++                                                status);
++}
++
++static int32_t private_decode_eos_progress(
++    VADisplay display, VAContextID context_id, uint32_t max_outputs,
++    uint32_t flags, struct advc_vaapi_decode_eos_status_v1 *status) {
++    VADriverContextP driver_context;
++    struct advc_vaapi_driver *driver;
++    if (flags != 0)
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    driver_context = driver_context_from_display(display);
++    driver = driver_from_context(driver_context);
++    if (driver == NULL) return private_eos_invalid_display_status(status);
++    return advc_vaapi_decode_progress_eos_private(
++        driver->decode, context_id, max_outputs, status);
++}
++
++static const struct advc_vaapi_decode_eos_interface_v1
++    private_decode_eos_interface = {
++        .struct_size = sizeof(private_decode_eos_interface),
++        .abi_version = ADVC_VAAPI_DECODE_EOS_ABI_VERSION,
++        .capabilities =
++            ADVC_VAAPI_DECODE_EOS_CAP_SIGNAL_PROGRESS_SPLIT |
++            ADVC_VAAPI_DECODE_EOS_CAP_CONTROL_EOS_NO_PTS_MATCH |
++            ADVC_VAAPI_DECODE_EOS_CAP_BOUNDED_PROGRESS,
++        .signal = private_decode_eos_signal,
++        .progress = private_decode_eos_progress,
++    };
++
++/*
++ * vaGetLibFunc(display, ADVC_VAAPI_DECODE_EOS_GET_INTERFACE_SYMBOL) resolves
++ * this symbol.  Merely finding the symbol is not an opt-in: the getter returns
++ * NULL unless the exact validation gate is present.
++ */
++__attribute__((visibility("default")))
++const struct advc_vaapi_decode_eos_interface_v1 *
++advcVaGetDecodeEosInterface_1_0(void) {
++    return advc_vaapi_decode_eos_gate_enabled()
++               ? &private_decode_eos_interface
++               : NULL;
++}
++
+ /*
+  * Libva's stable loader symbol. Profile advertisement remains opt-in until
+  * the real-device AVC/PRIME
+diff --git a/eos-patch-current/src/vaapi_advc/advc_vaapi_decode_eos.c b/src/vaapi_advc/advc_vaapi_decode_eos.c
+new file mode 100644
+index 0000000..3d961d1
+--- /dev/null
++++ b/src/vaapi_advc/advc_vaapi_decode_eos.c
+@@ -0,0 +1,255 @@
++#include "advc_vaapi_decode_eos.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++static uint32_t persistent_status_flags(
++    const struct advc_vaapi_decode_eos_state *state) {
++    uint32_t flags = 0;
++    if (state->signal_requested != 0)
++        flags |= ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_REQUESTED;
++    if (state->signal_queued != 0)
++        flags |= ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_QUEUED;
++    if (state->output_eos_seen != 0)
++        flags |= ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_EOS_SEEN;
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_FAILED)
++        flags |= ADVC_VAAPI_DECODE_EOS_STATUS_FAILED;
++    return flags;
++}
++
++static void write_status(
++    const struct advc_vaapi_decode_eos_state *state,
++    struct advc_vaapi_decode_eos_status_v1 *status, int32_t result,
++    uint32_t transient_flags, uint32_t outputs, uint32_t frames,
++    uint32_t controls) {
++    uint32_t caller_size;
++    if (status == NULL) return;
++    caller_size = status->struct_size;
++    memset(status, 0, sizeof(*status));
++    status->struct_size = caller_size;
++    status->abi_version = ADVC_VAAPI_DECODE_EOS_ABI_VERSION;
++    status->phase = state == NULL ? ADVC_VAAPI_DECODE_EOS_FAILED : state->phase;
++    status->flags = transient_flags;
++    if (state != NULL) {
++        status->flags |= persistent_status_flags(state);
++        status->outputs_processed_total = state->outputs_processed_total;
++        status->frames_processed_total = state->frames_processed_total;
++        status->controls_released_total = state->controls_released_total;
++    }
++    status->last_result = result;
++    status->outputs_processed = outputs;
++    status->frames_processed = frames;
++    status->controls_released = controls;
++}
++
++static int status_is_valid(
++    const struct advc_vaapi_decode_eos_status_v1 *status) {
++    return status != NULL && status->struct_size >= sizeof(*status);
++}
++
++static int ops_are_valid(const struct advc_vaapi_decode_eos_ops *ops) {
++    return ops != NULL && ops->try_signal != NULL &&
++           ops->try_dequeue != NULL && ops->handle_frame != NULL &&
++           ops->release_output != NULL &&
++           ops->mark_remaining_pending_failed != NULL;
++}
++
++static int32_t fail_state(
++    struct advc_vaapi_decode_eos_state *state,
++    struct advc_vaapi_decode_eos_status_v1 *status, uint32_t outputs,
++    uint32_t frames, uint32_t controls) {
++    state->phase = ADVC_VAAPI_DECODE_EOS_FAILED;
++    write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_FAILED, 0,
++                 outputs, frames, controls);
++    return ADVC_VAAPI_DECODE_EOS_RESULT_FAILED;
++}
++
++static int32_t discard_and_fail(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops,
++    const struct advc_vaapi_decode_eos_output *output,
++    struct advc_vaapi_decode_eos_status_v1 *status, uint32_t outputs,
++    uint32_t frames, uint32_t controls) {
++    if (output->buffer_id != 0)
++        (void)ops->release_output(ops->opaque, output);
++    return fail_state(state, status, outputs, frames, controls);
++}
++
++int advc_vaapi_decode_eos_gate_value_enabled(const char *value) {
++    return value != NULL &&
++           strcmp(value, ADVC_VAAPI_DECODE_EOS_OPT_IN_VALUE) == 0;
++}
++
++int advc_vaapi_decode_eos_gate_enabled(void) {
++    return advc_vaapi_decode_eos_gate_value_enabled(
++        getenv(ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV));
++}
++
++void advc_vaapi_decode_eos_state_init(
++    struct advc_vaapi_decode_eos_state *state) {
++    if (state == NULL) return;
++    memset(state, 0, sizeof(*state));
++    state->phase = ADVC_VAAPI_DECODE_EOS_OPEN;
++}
++
++int32_t advc_vaapi_decode_eos_state_signal(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    int32_t io_result;
++    if (state == NULL || !ops_are_valid(ops) || !status_is_valid(status)) {
++        if (status != NULL)
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT, 0, 0,
++                         0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_FAILED) {
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_FAILED, 0, 0,
++                     0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_FAILED;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_COMPLETE) {
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE, 0,
++                     0, 0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_DRAINING) {
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_OK, 0, 0, 0,
++                     0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_OK;
++    }
++
++    state->signal_requested = 1;
++    state->phase = ADVC_VAAPI_DECODE_EOS_SIGNAL_PENDING;
++    io_result = ops->try_signal(ops->opaque);
++    if (io_result == ADVC_VAAPI_DECODE_EOS_IO_OK) {
++        state->signal_queued = 1;
++        state->phase = ADVC_VAAPI_DECODE_EOS_DRAINING;
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_OK, 0, 0, 0,
++                     0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_OK;
++    }
++    if (io_result == ADVC_VAAPI_DECODE_EOS_IO_RETRY ||
++        io_result == ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL) {
++        uint32_t flag = io_result == ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL
++                            ? ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_WINDOW_FULL
++                            : 0;
++        int32_t result =
++            io_result == ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL
++                ? ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE
++                : ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK;
++        write_status(state, status, result, flag, 0, 0, 0);
++        return result;
++    }
++    return fail_state(state, status, 0, 0, 0);
++}
++
++int32_t advc_vaapi_decode_eos_state_progress(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops, uint32_t max_outputs,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    uint32_t outputs = 0;
++    uint32_t frames = 0;
++    uint32_t controls = 0;
++    if (state == NULL || !ops_are_valid(ops) || !status_is_valid(status) ||
++        max_outputs == 0 ||
++        max_outputs > ADVC_VAAPI_DECODE_EOS_MAX_PROGRESS_OUTPUTS) {
++        if (status != NULL)
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT, 0, 0,
++                         0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_OPEN) {
++        write_status(state, status,
++                     ADVC_VAAPI_DECODE_EOS_RESULT_NOT_SIGNALED, 0, 0, 0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_NOT_SIGNALED;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_FAILED) {
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_FAILED, 0, 0,
++                     0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_FAILED;
++    }
++    if (state->phase == ADVC_VAAPI_DECODE_EOS_COMPLETE) {
++        write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE, 0,
++                     0, 0, 0);
++        return ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE;
++    }
++
++    while (outputs < max_outputs) {
++        struct advc_vaapi_decode_eos_output output;
++        int32_t io_result;
++        memset(&output, 0, sizeof(output));
++        io_result = ops->try_dequeue(ops->opaque, &output);
++        if (io_result == ADVC_VAAPI_DECODE_EOS_IO_RETRY) {
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK,
++                         ADVC_VAAPI_DECODE_EOS_STATUS_BROKER_EMPTY, outputs,
++                         frames, controls);
++            return ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK;
++        }
++        if (io_result == ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL) {
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE,
++                         ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_WINDOW_FULL,
++                         outputs, frames, controls);
++            return ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE;
++        }
++        if (io_result != ADVC_VAAPI_DECODE_EOS_IO_OK)
++            return fail_state(state, status, outputs, frames, controls);
++
++        ++outputs;
++        ++state->outputs_processed_total;
++        if (output.buffer_id == 0)
++            return fail_state(state, status, outputs, frames, controls);
++
++        if (output.kind == ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL) {
++            if (output.flags != ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS)
++                return discard_and_fail(state, ops, &output, status, outputs,
++                                        frames, controls);
++            if (ops->release_output(ops->opaque, &output) !=
++                ADVC_VAAPI_DECODE_EOS_IO_OK)
++                return fail_state(state, status, outputs, frames, controls);
++            ++controls;
++            ++state->controls_released_total;
++            if (state->phase != ADVC_VAAPI_DECODE_EOS_DRAINING)
++                return fail_state(state, status, outputs, frames, controls);
++            ops->mark_remaining_pending_failed(ops->opaque);
++            state->output_eos_seen = 1;
++            state->phase = ADVC_VAAPI_DECODE_EOS_COMPLETE;
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE, 0, outputs,
++                         frames, controls);
++            return ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE;
++        }
++
++        if (output.kind != ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME)
++            return discard_and_fail(state, ops, &output, status, outputs,
++                                    frames, controls);
++        if ((output.flags & ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS) != 0 &&
++            state->phase != ADVC_VAAPI_DECODE_EOS_DRAINING)
++            return discard_and_fail(state, ops, &output, status, outputs,
++                                    frames, controls);
++        if (ops->handle_frame(ops->opaque, &output) !=
++            ADVC_VAAPI_DECODE_EOS_IO_OK)
++            return discard_and_fail(state, ops, &output, status, outputs,
++                                    frames, controls);
++        ++frames;
++        ++state->frames_processed_total;
++        if ((output.flags & ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS) != 0) {
++            ops->mark_remaining_pending_failed(ops->opaque);
++            state->output_eos_seen = 1;
++            state->phase = ADVC_VAAPI_DECODE_EOS_COMPLETE;
++            write_status(state, status,
++                         ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE, 0, outputs,
++                         frames, controls);
++            return ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE;
++        }
++    }
++
++    write_status(state, status, ADVC_VAAPI_DECODE_EOS_RESULT_OK,
++                 ADVC_VAAPI_DECODE_EOS_STATUS_BUDGET_EXHAUSTED, outputs,
++                 frames, controls);
++    return ADVC_VAAPI_DECODE_EOS_RESULT_OK;
++}
+diff --git a/eos-patch-current/src/vaapi_advc/advc_vaapi_decode_eos.h b/src/vaapi_advc/advc_vaapi_decode_eos.h
+new file mode 100644
+index 0000000..474e7e5
+--- /dev/null
++++ b/src/vaapi_advc/advc_vaapi_decode_eos.h
+@@ -0,0 +1,156 @@
++#ifndef ADVC_VAAPI_DECODE_EOS_H
++#define ADVC_VAAPI_DECODE_EOS_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Private, opt-in ABI.  This is deliberately not a VA-API extension and is
++ * obtained only by an integration which calls vaGetLibFunc() with the exact
++ * symbol below.  A stock VA-API client neither discovers nor invokes it.
++ */
++#define ADVC_VAAPI_DECODE_EOS_GET_INTERFACE_SYMBOL \
++    "advcVaGetDecodeEosInterface_1_0"
++#define ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV \
++    "ADVC_VAAPI_ENABLE_PRIVATE_DECODE_EOS"
++#define ADVC_VAAPI_DECODE_EOS_OPT_IN_VALUE \
++    "validated-signal-progress-v1"
++
++#define ADVC_VAAPI_DECODE_EOS_ABI_MAJOR 1u
++#define ADVC_VAAPI_DECODE_EOS_ABI_MINOR 0u
++#define ADVC_VAAPI_DECODE_EOS_ABI_VERSION \
++    ((ADVC_VAAPI_DECODE_EOS_ABI_MAJOR << 16) | \
++     ADVC_VAAPI_DECODE_EOS_ABI_MINOR)
++
++/* The broker has a finite eight-output lease window. */
++#define ADVC_VAAPI_DECODE_EOS_MAX_PROGRESS_OUTPUTS 8u
++
++/* Kept independent of protocol.h; integration must static-assert equality. */
++#define ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS (1u << 0)
++
++enum advc_vaapi_decode_eos_phase {
++    ADVC_VAAPI_DECODE_EOS_OPEN = 0,
++    ADVC_VAAPI_DECODE_EOS_SIGNAL_PENDING = 1,
++    ADVC_VAAPI_DECODE_EOS_DRAINING = 2,
++    ADVC_VAAPI_DECODE_EOS_COMPLETE = 3,
++    ADVC_VAAPI_DECODE_EOS_FAILED = 4,
++};
++
++/* Stable private-ABI result values returned by signal() and progress(). */
++enum advc_vaapi_decode_eos_result {
++    ADVC_VAAPI_DECODE_EOS_RESULT_OK = 0,
++    ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK = 1,
++    ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE = 2,
++    ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE = 3,
++    ADVC_VAAPI_DECODE_EOS_RESULT_NOT_SIGNALED = 4,
++    ADVC_VAAPI_DECODE_EOS_RESULT_DISABLED = 5,
++    ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT = -1,
++    ADVC_VAAPI_DECODE_EOS_RESULT_FAILED = -2,
++    ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT = -3,
++};
++
++enum advc_vaapi_decode_eos_status_flag {
++    ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_REQUESTED = 1u << 0,
++    ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_QUEUED = 1u << 1,
++    ADVC_VAAPI_DECODE_EOS_STATUS_BROKER_EMPTY = 1u << 2,
++    ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_WINDOW_FULL = 1u << 3,
++    ADVC_VAAPI_DECODE_EOS_STATUS_BUDGET_EXHAUSTED = 1u << 4,
++    ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_EOS_SEEN = 1u << 5,
++    ADVC_VAAPI_DECODE_EOS_STATUS_FAILED = 1u << 6,
++};
++
++struct advc_vaapi_decode_eos_status_v1 {
++    /* Caller sets this to sizeof(struct advc_vaapi_decode_eos_status_v1). */
++    uint32_t struct_size;
++    uint32_t abi_version;
++    uint32_t phase;
++    uint32_t flags;
++    int32_t last_result;
++    uint32_t outputs_processed;
++    uint32_t frames_processed;
++    uint32_t controls_released;
++    uint64_t outputs_processed_total;
++    uint64_t frames_processed_total;
++    uint64_t controls_released_total;
++    uint32_t reserved[8];
++};
++
++/*
++ * Internal nonblocking state-machine adapter.
++ *
++ * A successful dequeue transfers one broker output lease to this function.
++ * handle_frame() consumes that lease on OK, either by releasing it or by
++ * attaching it to a VA surface.  On any other return it must not consume the
++ * lease; release_output() is then attempted exactly once.  A control output is
++ * never passed to handle_frame(), so no PTS-to-surface lookup occurs for the
++ * terminal zero-byte EOS token.  mark_remaining_pending_failed() runs exactly
++ * once after the terminal output is consumed; a runtime uses it to fail closed
++ * any same-session surfaces for which no output can now arrive.
++ *
++ * All callbacks are try/bounded operations and must not wait for an output or
++ * a surface release.  Calls are externally serialized by the decode runtime.
++ */
++enum advc_vaapi_decode_eos_io_result {
++    ADVC_VAAPI_DECODE_EOS_IO_OK = 0,
++    ADVC_VAAPI_DECODE_EOS_IO_RETRY = 1,
++    ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL = 2,
++    ADVC_VAAPI_DECODE_EOS_IO_FATAL = -1,
++};
++
++enum advc_vaapi_decode_eos_output_kind {
++    ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME = 1,
++    ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL = 2,
++};
++
++struct advc_vaapi_decode_eos_output {
++    uint64_t buffer_id;
++    uint64_t pts_ns;
++    uint32_t flags;
++    uint32_t kind;
++    void *private_data;
++};
++
++struct advc_vaapi_decode_eos_ops {
++    void *opaque;
++    int32_t (*try_signal)(void *opaque);
++    int32_t (*try_dequeue)(
++        void *opaque, struct advc_vaapi_decode_eos_output *output);
++    int32_t (*handle_frame)(
++        void *opaque, const struct advc_vaapi_decode_eos_output *output);
++    int32_t (*release_output)(
++        void *opaque, const struct advc_vaapi_decode_eos_output *output);
++    void (*mark_remaining_pending_failed)(void *opaque);
++};
++
++struct advc_vaapi_decode_eos_state {
++    uint32_t phase;
++    uint32_t signal_requested;
++    uint32_t signal_queued;
++    uint32_t output_eos_seen;
++    uint64_t outputs_processed_total;
++    uint64_t frames_processed_total;
++    uint64_t controls_released_total;
++};
++
++int advc_vaapi_decode_eos_gate_value_enabled(const char *value);
++int advc_vaapi_decode_eos_gate_enabled(void);
++
++void advc_vaapi_decode_eos_state_init(
++    struct advc_vaapi_decode_eos_state *state);
++int32_t advc_vaapi_decode_eos_state_signal(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops,
++    struct advc_vaapi_decode_eos_status_v1 *status);
++int32_t advc_vaapi_decode_eos_state_progress(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops, uint32_t max_outputs,
++    struct advc_vaapi_decode_eos_status_v1 *status);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/eos-patch-current/src/vaapi_advc/advc_vaapi_decode_eos_private.h b/src/vaapi_advc/advc_vaapi_decode_eos_private.h
+new file mode 100644
+index 0000000..eb204c2
+--- /dev/null
++++ b/src/vaapi_advc/advc_vaapi_decode_eos_private.h
+@@ -0,0 +1,52 @@
++#ifndef ADVC_VAAPI_DECODE_EOS_PRIVATE_H
++#define ADVC_VAAPI_DECODE_EOS_PRIVATE_H
++
++#include "advc_vaapi_decode_eos.h"
++
++#include <va/va.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Caller ABI returned by the versioned private getter.  signal/progress flags
++ * are reserved in ABI 1.0 and must be zero.  max_outputs is in [1, 8]; one is
++ * recommended so a framework can push and release each newly-ready surface
++ * before it asks the driver to dequeue again.
++ */
++typedef int32_t (*advc_vaapi_decode_eos_signal_v1_fn)(
++    VADisplay display, VAContextID context_id, uint32_t flags,
++    struct advc_vaapi_decode_eos_status_v1 *status);
++typedef int32_t (*advc_vaapi_decode_eos_progress_v1_fn)(
++    VADisplay display, VAContextID context_id, uint32_t max_outputs,
++    uint32_t flags, struct advc_vaapi_decode_eos_status_v1 *status);
++
++enum advc_vaapi_decode_eos_capability {
++    ADVC_VAAPI_DECODE_EOS_CAP_SIGNAL_PROGRESS_SPLIT = 1u << 0,
++    ADVC_VAAPI_DECODE_EOS_CAP_CONTROL_EOS_NO_PTS_MATCH = 1u << 1,
++    ADVC_VAAPI_DECODE_EOS_CAP_BOUNDED_PROGRESS = 1u << 2,
++};
++
++struct advc_vaapi_decode_eos_interface_v1 {
++    uint32_t struct_size;
++    uint32_t abi_version;
++    uint32_t capabilities;
++    uint32_t reserved0;
++    advc_vaapi_decode_eos_signal_v1_fn signal;
++    advc_vaapi_decode_eos_progress_v1_fn progress;
++    uintptr_t reserved[8];
++};
++
++typedef const struct advc_vaapi_decode_eos_interface_v1 *
++    (*advc_vaapi_decode_eos_get_interface_v1_fn)(void);
++
++/* Exported by advc_drv_video.so; normally resolved through vaGetLibFunc(). */
++const struct advc_vaapi_decode_eos_interface_v1 *
++advcVaGetDecodeEosInterface_1_0(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/vaapi_advc/advc_vaapi_decode_runtime.c b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+index 282bc1b..2c9b9f1 100644
+--- a/src/vaapi_advc/advc_vaapi_decode_runtime.c
++++ b/src/vaapi_advc/advc_vaapi_decode_runtime.c
+@@ -3,6 +3,7 @@
+ #include "advc_vaapi_decode_runtime.h"
+ 
+ #include "advc_h264_annexb.h"
++#include "advc_vaapi_decode_eos.h"
+ #include "advc_vaapi_decode_hevc.h"
+ #include "advc_vaapi_decode_vp9.h"
+ #include "advc_vaapi_slice_layout.h"
+@@ -40,6 +41,9 @@
+ #define DRM_FORMAT_R8 UINT32_C(0x20203852)
+ #define DRM_FORMAT_GR88 UINT32_C(0x38385247)
+ 
++_Static_assert(ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS ==
++                   ADVC_FLAG_END_OF_STREAM,
++               "private EOS flag must match the broker protocol");
+ struct advc_vaapi_config {
+     int used;
+     VAProfile profile;
+@@ -113,6 +117,7 @@ struct advc_vaapi_context {
+     uint8_t pps_l1_default_active_minus1;
+     uint8_t pps_l0_known;
+     uint8_t pps_l1_known;
++    struct advc_vaapi_decode_eos_state eos;
+ };
+ 
+ struct advc_vaapi_decode_runtime {
+@@ -799,6 +804,10 @@ static int convert_output(
+     return -1;
+ }
+ 
++static int private_eos_drain_one(
++    struct advc_vaapi_decode_runtime *runtime,
++    struct advc_vaapi_context *context);
++
+ static int drain_one_output(struct advc_vaapi_decode_runtime *runtime,
+                             struct advc_vaapi_context *context) {
+     struct advc_client_output output;
+@@ -806,6 +815,8 @@ static int drain_one_output(struct advc_vaapi_decode_runtime *runtime,
+     uint32_t detail = 0;
+     unsigned int i;
+     int status;
++    if (context->eos.phase != ADVC_VAAPI_DECODE_EOS_OPEN)
++        return private_eos_drain_one(runtime, context);
+     memset(&output, 0, sizeof(output));
+     output.data_fd = -1;
+     output.acquire_fence_fd = -1;
+@@ -841,6 +852,268 @@ static int drain_one_output(struct advc_vaapi_decode_runtime *runtime,
+     return 1;
+ }
+ 
++struct private_eos_adapter {
++    struct advc_vaapi_decode_runtime *runtime;
++    struct advc_vaapi_context *context;
++    struct advc_client_output client_output;
++    int have_output;
++};
++
++static int32_t private_eos_immediate_status(
++    struct advc_vaapi_decode_eos_status_v1 *status, int32_t result,
++    uint32_t phase, uint32_t flags) {
++    uint32_t caller_size;
++    if (status == NULL || status->struct_size < sizeof(*status))
++        return ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT;
++    caller_size = status->struct_size;
++    memset(status, 0, sizeof(*status));
++    status->struct_size = caller_size;
++    status->abi_version = ADVC_VAAPI_DECODE_EOS_ABI_VERSION;
++    status->phase = phase;
++    status->flags = flags;
++    status->last_result = result;
++    return result;
++}
++
++static int32_t private_eos_try_signal(void *opaque) {
++    struct private_eos_adapter *adapter = opaque;
++    struct advc_client_input input;
++    uint32_t detail = 0;
++    int status;
++    memset(&input, 0, sizeof(input));
++    input.data_fd = -1;
++    input.flags = ADVC_FLAG_END_OF_STREAM;
++    status = advc_client_queue_input(adapter->context->broker_fd,
++                                     adapter->context->broker_session, &input,
++                                     &detail);
++    if (status == ADVC_STATUS_OK) return ADVC_VAAPI_DECODE_EOS_IO_OK;
++    if (status == ADVC_STATUS_WOULD_BLOCK)
++        return ADVC_VAAPI_DECODE_EOS_IO_RETRY;
++    if (status == ADVC_STATUS_NO_RESOURCE)
++        return ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL;
++    return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++}
++
++static int32_t private_eos_try_dequeue(
++    void *opaque, struct advc_vaapi_decode_eos_output *output) {
++    struct private_eos_adapter *adapter = opaque;
++    uint32_t detail = 0;
++    int status;
++    if (adapter->have_output || output == NULL)
++        return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    memset(&adapter->client_output, 0, sizeof(adapter->client_output));
++    adapter->client_output.data_fd = -1;
++    adapter->client_output.acquire_fence_fd = -1;
++    status = advc_client_dequeue_output(
++        adapter->context->broker_fd, adapter->context->broker_session,
++        &adapter->client_output, &detail);
++    if (status == ADVC_STATUS_WOULD_BLOCK)
++        return ADVC_VAAPI_DECODE_EOS_IO_RETRY;
++    if (status == ADVC_STATUS_NO_RESOURCE)
++        return ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL;
++    if (status != ADVC_STATUS_OK)
++        return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    adapter->have_output = 1;
++    memset(output, 0, sizeof(*output));
++    output->buffer_id = adapter->client_output.buffer_id;
++    output->pts_ns = adapter->client_output.pts_ns;
++    output->flags = adapter->client_output.flags;
++    output->kind =
++        adapter->client_output.transport == ADVC_TRANSPORT_BYTES &&
++                adapter->client_output.size == 0 &&
++                (adapter->client_output.flags & ADVC_FLAG_END_OF_STREAM) != 0
++            ? ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL
++            : ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME;
++    output->private_data = &adapter->client_output;
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static int32_t private_eos_handle_frame(
++    void *opaque, const struct advc_vaapi_decode_eos_output *output) {
++    struct private_eos_adapter *adapter = opaque;
++    struct advc_vaapi_surface *surface = NULL;
++    unsigned int i;
++    if (!adapter->have_output || output == NULL ||
++        output->private_data != &adapter->client_output)
++        return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    for (i = 0; i < ADVC_VAAPI_SURFACE_SLOTS; ++i) {
++        if (adapter->runtime->surfaces[i].used &&
++            adapter->runtime->surfaces[i].state == ADVC_SURFACE_PENDING &&
++            adapter->runtime->surfaces[i].pts_ns == output->pts_ns &&
++            adapter->runtime->surfaces[i].owner_session ==
++                adapter->context->broker_session) {
++            surface = &adapter->runtime->surfaces[i];
++            break;
++        }
++    }
++    if (surface == NULL ||
++        convert_output(adapter->runtime, adapter->context, surface,
++                       &adapter->client_output) < 0) {
++        if (surface != NULL) surface->state = ADVC_SURFACE_ERROR;
++        return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    }
++    advc_client_output_close(&adapter->client_output);
++    adapter->have_output = 0;
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static int32_t private_eos_release_output(
++    void *opaque, const struct advc_vaapi_decode_eos_output *output) {
++    struct private_eos_adapter *adapter = opaque;
++    uint32_t detail = 0;
++    int status;
++    if (!adapter->have_output || output == NULL ||
++        output->private_data != &adapter->client_output)
++        return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    status = advc_client_release_output(
++        adapter->context->broker_fd, adapter->context->broker_session,
++        adapter->client_output.buffer_id, &detail);
++    advc_client_output_close(&adapter->client_output);
++    adapter->have_output = 0;
++    return status == ADVC_STATUS_OK ? ADVC_VAAPI_DECODE_EOS_IO_OK
++                                    : ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++}
++
++static void private_eos_mark_remaining_pending_failed(void *opaque) {
++    struct private_eos_adapter *adapter = opaque;
++    unsigned int i;
++    for (i = 0; i < ADVC_VAAPI_SURFACE_SLOTS; ++i) {
++        struct advc_vaapi_surface *surface = &adapter->runtime->surfaces[i];
++        if (surface->used && surface->state == ADVC_SURFACE_PENDING &&
++            surface->owner_session == adapter->context->broker_session)
++            surface->state = ADVC_SURFACE_ERROR;
++    }
++}
++
++static struct advc_vaapi_decode_eos_ops private_eos_ops(
++    struct private_eos_adapter *adapter) {
++    struct advc_vaapi_decode_eos_ops ops;
++    memset(&ops, 0, sizeof(ops));
++    ops.opaque = adapter;
++    ops.try_signal = private_eos_try_signal;
++    ops.try_dequeue = private_eos_try_dequeue;
++    ops.handle_frame = private_eos_handle_frame;
++    ops.release_output = private_eos_release_output;
++    ops.mark_remaining_pending_failed =
++        private_eos_mark_remaining_pending_failed;
++    return ops;
++}
++
++/*
++ * The runtime mutex is held by every caller.  Both the private progress API
++ * and normal surface sync/query use this helper once EOS has been signalled,
++ * so there is exactly one owner of broker dequeue and terminal EOS cannot be
++ * consumed without updating context->eos.
++ */
++static int32_t private_eos_progress_locked(
++    struct advc_vaapi_decode_runtime *runtime,
++    struct advc_vaapi_context *context, uint32_t max_outputs,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    struct private_eos_adapter adapter;
++    struct advc_vaapi_decode_eos_ops ops;
++    int32_t result;
++    memset(&adapter, 0, sizeof(adapter));
++    adapter.runtime = runtime;
++    adapter.context = context;
++    ops = private_eos_ops(&adapter);
++    result = advc_vaapi_decode_eos_state_progress(
++        &context->eos, &ops, max_outputs, status);
++    if (adapter.have_output)
++        (void)private_eos_release_output(
++            &adapter, &(struct advc_vaapi_decode_eos_output){
++                          .buffer_id = adapter.client_output.buffer_id,
++                          .private_data = &adapter.client_output,
++                      });
++    return result;
++}
++
++static int private_eos_drain_one(
++    struct advc_vaapi_decode_runtime *runtime,
++    struct advc_vaapi_context *context) {
++    struct advc_vaapi_decode_eos_status_v1 status;
++    int32_t result;
++    memset(&status, 0, sizeof(status));
++    status.struct_size = sizeof(status);
++    result = private_eos_progress_locked(runtime, context, 1, &status);
++    if (result == ADVC_VAAPI_DECODE_EOS_RESULT_OK ||
++        result == ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE)
++        return status.frames_processed > 0 ? 1 : 0;
++    if (result == ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK ||
++        result == ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE)
++        return 0;
++    return -1;
++}
++
++int32_t advc_vaapi_decode_signal_eos_private(
++    struct advc_vaapi_decode_runtime *runtime, VAContextID context_id,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    struct private_eos_adapter adapter;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_context *context;
++    int32_t result;
++    if (!advc_vaapi_decode_eos_gate_enabled())
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_DISABLED,
++            ADVC_VAAPI_DECODE_EOS_OPEN, 0);
++    if (runtime == NULL)
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT,
++            ADVC_VAAPI_DECODE_EOS_FAILED,
++            ADVC_VAAPI_DECODE_EOS_STATUS_FAILED);
++    pthread_mutex_lock(&runtime->mutex);
++    context = get_context(runtime, context_id);
++    if (context == NULL) {
++        pthread_mutex_unlock(&runtime->mutex);
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT,
++            ADVC_VAAPI_DECODE_EOS_FAILED,
++            ADVC_VAAPI_DECODE_EOS_STATUS_FAILED);
++    }
++    if (context->picture_active) {
++        uint32_t phase = context->eos.phase;
++        pthread_mutex_unlock(&runtime->mutex);
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT, phase, 0);
++    }
++    memset(&adapter, 0, sizeof(adapter));
++    adapter.runtime = runtime;
++    adapter.context = context;
++    ops = private_eos_ops(&adapter);
++    result = advc_vaapi_decode_eos_state_signal(&context->eos, &ops, status);
++    pthread_mutex_unlock(&runtime->mutex);
++    return result;
++}
++
++int32_t advc_vaapi_decode_progress_eos_private(
++    struct advc_vaapi_decode_runtime *runtime, VAContextID context_id,
++    uint32_t max_outputs,
++    struct advc_vaapi_decode_eos_status_v1 *status) {
++    struct advc_vaapi_context *context;
++    int32_t result;
++    if (!advc_vaapi_decode_eos_gate_enabled())
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_DISABLED,
++            ADVC_VAAPI_DECODE_EOS_OPEN, 0);
++    if (runtime == NULL)
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT,
++            ADVC_VAAPI_DECODE_EOS_FAILED,
++            ADVC_VAAPI_DECODE_EOS_STATUS_FAILED);
++    pthread_mutex_lock(&runtime->mutex);
++    context = get_context(runtime, context_id);
++    if (context == NULL) {
++        pthread_mutex_unlock(&runtime->mutex);
++        return private_eos_immediate_status(
++            status, ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_CONTEXT,
++            ADVC_VAAPI_DECODE_EOS_FAILED,
++            ADVC_VAAPI_DECODE_EOS_STATUS_FAILED);
++    }
++    result =
++        private_eos_progress_locked(runtime, context, max_outputs, status);
++    pthread_mutex_unlock(&runtime->mutex);
++    return result;
++}
++
+ static int queue_bytes_with_drain(
+     struct advc_vaapi_decode_runtime *runtime,
+     struct advc_vaapi_context *context, const uint8_t *data, size_t size,
+@@ -1221,6 +1494,7 @@ VAStatus advc_vaapi_decode_create_context(
+     runtime->contexts[i].height = (uint32_t)height;
+     runtime->contexts[i].codec = codec_for_profile(config->profile);
+     runtime->contexts[i].target = VA_INVALID_SURFACE;
++    advc_vaapi_decode_eos_state_init(&runtime->contexts[i].eos);
+     *context_id = make_id(ADVC_VAAPI_TYPE_CONTEXT, i);
+     pthread_mutex_unlock(&runtime->mutex);
+     return VA_STATUS_SUCCESS;
+@@ -1387,6 +1661,7 @@ VAStatus advc_vaapi_decode_begin_picture(
+     context = get_context(runtime, context_id);
+     surface = get_surface(runtime, target);
+     if (context == NULL || surface == NULL || context->picture_active ||
++        context->eos.phase != ADVC_VAAPI_DECODE_EOS_OPEN ||
+         surface->width != context->width || surface->height != context->height) {
+         pthread_mutex_unlock(&runtime->mutex);
+         if (context == NULL) return VA_STATUS_ERROR_INVALID_CONTEXT;
+@@ -1402,6 +1677,7 @@ VAStatus advc_vaapi_decode_begin_picture(
+         context = get_context(runtime, context_id);
+         surface = get_surface(runtime, target);
+         if (context == NULL || surface == NULL || context->picture_active ||
++            context->eos.phase != ADVC_VAAPI_DECODE_EOS_OPEN ||
+             surface->width != context->width ||
+             surface->height != context->height) {
+             pthread_mutex_unlock(&runtime->mutex);
+diff --git a/src/vaapi_advc/advc_vaapi_decode_runtime.h b/src/vaapi_advc/advc_vaapi_decode_runtime.h
+index f92ee4c..bd284aa 100644
+--- a/src/vaapi_advc/advc_vaapi_decode_runtime.h
++++ b/src/vaapi_advc/advc_vaapi_decode_runtime.h
+@@ -1,6 +1,7 @@
+ #ifndef ADVC_VAAPI_DECODE_RUNTIME_H
+ #define ADVC_VAAPI_DECODE_RUNTIME_H
+ 
++#include "advc_vaapi_decode_eos.h"
+ #include "advc_vaapi_policy.h"
+ 
+ #include <va/va_backend.h>
+@@ -79,6 +80,14 @@ VAStatus advc_vaapi_decode_export_surface(
+     struct advc_vaapi_decode_runtime *runtime, VASurfaceID surface,
+     uint32_t mem_type, uint32_t flags, void *descriptor);
+ 
++int32_t advc_vaapi_decode_signal_eos_private(
++    struct advc_vaapi_decode_runtime *runtime, VAContextID context_id,
++    struct advc_vaapi_decode_eos_status_v1 *status);
++int32_t advc_vaapi_decode_progress_eos_private(
++    struct advc_vaapi_decode_runtime *runtime, VAContextID context_id,
++    uint32_t max_outputs,
++    struct advc_vaapi_decode_eos_status_v1 *status);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/eos-patch-current/src/vaapi_advc/tests/decode_eos_test.c b/src/vaapi_advc/tests/decode_eos_test.c
+new file mode 100644
+index 0000000..7234be9
+--- /dev/null
++++ b/src/vaapi_advc/tests/decode_eos_test.c
+@@ -0,0 +1,551 @@
++#define _POSIX_C_SOURCE 200809L
++
++#include "advc_vaapi_decode_eos.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++
++#define CHECK(condition)                                                       \
++    do {                                                                       \
++        if (!(condition)) {                                                    \
++            fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, \
++                    #condition);                                               \
++            exit(1);                                                           \
++        }                                                                      \
++    } while (0)
++
++struct mock_item {
++    int32_t result;
++    struct advc_vaapi_decode_eos_output output;
++};
++
++struct mock_broker {
++    int32_t signal_results[4];
++    size_t signal_result_count;
++    size_t signal_result_index;
++    struct mock_item items[16];
++    size_t item_count;
++    size_t item_index;
++    uint32_t window_size;
++    uint32_t outstanding_leases;
++    int fail_frame;
++    int fail_release;
++    int retain_frames;
++    uint32_t signal_calls;
++    uint32_t dequeue_calls;
++    uint32_t frame_calls;
++    uint32_t release_calls;
++    uint64_t handled_ids[16];
++    uint64_t released_ids[16];
++    uint32_t terminal_session;
++    uint32_t terminal_calls;
++    int frame_surface_index;
++    uint32_t surface_sessions[4];
++    uint32_t surface_states[4];
++};
++
++enum mock_surface_state {
++    MOCK_SURFACE_UNUSED = 0,
++    MOCK_SURFACE_PENDING = 1,
++    MOCK_SURFACE_READY = 2,
++    MOCK_SURFACE_ERROR = 3,
++};
++
++static struct advc_vaapi_decode_eos_status_v1 fresh_status(void) {
++    struct advc_vaapi_decode_eos_status_v1 status;
++    memset(&status, 0, sizeof(status));
++    status.struct_size = (uint32_t)sizeof(status);
++    return status;
++}
++
++static void init_mock(struct mock_broker *mock) {
++    memset(mock, 0, sizeof(*mock));
++    mock->window_size = ADVC_VAAPI_DECODE_EOS_MAX_PROGRESS_OUTPUTS;
++    mock->frame_surface_index = -1;
++}
++
++static void add_item(struct mock_broker *mock, int32_t result, uint64_t id,
++                     uint64_t pts_ns, uint32_t flags, uint32_t kind) {
++    struct mock_item *item;
++    CHECK(mock->item_count < ARRAY_SIZE(mock->items));
++    item = &mock->items[mock->item_count++];
++    memset(item, 0, sizeof(*item));
++    item->result = result;
++    item->output.buffer_id = id;
++    item->output.pts_ns = pts_ns;
++    item->output.flags = flags;
++    item->output.kind = kind;
++}
++
++static int32_t mock_try_signal(void *opaque) {
++    struct mock_broker *mock = opaque;
++    ++mock->signal_calls;
++    if (mock->signal_result_index < mock->signal_result_count)
++        return mock->signal_results[mock->signal_result_index++];
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static int32_t mock_try_dequeue(
++    void *opaque, struct advc_vaapi_decode_eos_output *output) {
++    struct mock_broker *mock = opaque;
++    const struct mock_item *item;
++    ++mock->dequeue_calls;
++    if (mock->outstanding_leases >= mock->window_size)
++        return ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL;
++    if (mock->item_index >= mock->item_count)
++        return ADVC_VAAPI_DECODE_EOS_IO_RETRY;
++    item = &mock->items[mock->item_index++];
++    if (item->result != ADVC_VAAPI_DECODE_EOS_IO_OK)
++        return item->result;
++    *output = item->output;
++    ++mock->outstanding_leases;
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static int32_t mock_handle_frame(
++    void *opaque, const struct advc_vaapi_decode_eos_output *output) {
++    struct mock_broker *mock = opaque;
++    CHECK(mock->frame_calls < ARRAY_SIZE(mock->handled_ids));
++    mock->handled_ids[mock->frame_calls++] = output->buffer_id;
++    if (mock->fail_frame) return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    if (mock->frame_surface_index >= 0) {
++        CHECK((size_t)mock->frame_surface_index <
++              ARRAY_SIZE(mock->surface_states));
++        mock->surface_states[mock->frame_surface_index] = MOCK_SURFACE_READY;
++    }
++    if (!mock->retain_frames) {
++        CHECK(mock->outstanding_leases > 0);
++        --mock->outstanding_leases;
++    }
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static int32_t mock_release_output(
++    void *opaque, const struct advc_vaapi_decode_eos_output *output) {
++    struct mock_broker *mock = opaque;
++    CHECK(mock->release_calls < ARRAY_SIZE(mock->released_ids));
++    mock->released_ids[mock->release_calls++] = output->buffer_id;
++    if (mock->fail_release) return ADVC_VAAPI_DECODE_EOS_IO_FATAL;
++    CHECK(mock->outstanding_leases > 0);
++    --mock->outstanding_leases;
++    return ADVC_VAAPI_DECODE_EOS_IO_OK;
++}
++
++static void mock_mark_remaining_pending_failed(void *opaque) {
++    struct mock_broker *mock = opaque;
++    size_t i;
++    ++mock->terminal_calls;
++    for (i = 0; i < ARRAY_SIZE(mock->surface_states); ++i) {
++        if (mock->surface_states[i] == MOCK_SURFACE_PENDING &&
++            mock->surface_sessions[i] == mock->terminal_session)
++            mock->surface_states[i] = MOCK_SURFACE_ERROR;
++    }
++}
++
++static struct advc_vaapi_decode_eos_ops mock_ops(struct mock_broker *mock) {
++    struct advc_vaapi_decode_eos_ops ops;
++    memset(&ops, 0, sizeof(ops));
++    ops.opaque = mock;
++    ops.try_signal = mock_try_signal;
++    ops.try_dequeue = mock_try_dequeue;
++    ops.handle_frame = mock_handle_frame;
++    ops.release_output = mock_release_output;
++    ops.mark_remaining_pending_failed =
++        mock_mark_remaining_pending_failed;
++    return ops;
++}
++
++static void release_retained_frame(struct mock_broker *mock) {
++    CHECK(mock->outstanding_leases > 0);
++    --mock->outstanding_leases;
++}
++
++static int mock_normal_drain_one(
++    struct advc_vaapi_decode_eos_state *state,
++    const struct advc_vaapi_decode_eos_ops *ops) {
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    int32_t result =
++        advc_vaapi_decode_eos_state_progress(state, ops, 1, &status);
++    if (result == ADVC_VAAPI_DECODE_EOS_RESULT_OK ||
++        result == ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE)
++        return status.frames_processed > 0 ? 1 : 0;
++    if (result == ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK ||
++        result == ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE)
++        return 0;
++    return -1;
++}
++
++static void test_exact_opt_in_gate(void) {
++    CHECK(!advc_vaapi_decode_eos_gate_value_enabled(NULL));
++    CHECK(!advc_vaapi_decode_eos_gate_value_enabled("1"));
++    CHECK(!advc_vaapi_decode_eos_gate_value_enabled("validated-signal-progress-v1 "));
++    CHECK(advc_vaapi_decode_eos_gate_value_enabled(
++        ADVC_VAAPI_DECODE_EOS_OPT_IN_VALUE));
++
++    CHECK(unsetenv(ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV) == 0);
++    CHECK(!advc_vaapi_decode_eos_gate_enabled());
++    CHECK(setenv(ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV, "validated-v1", 1) == 0);
++    CHECK(!advc_vaapi_decode_eos_gate_enabled());
++    CHECK(setenv(ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV,
++                 ADVC_VAAPI_DECODE_EOS_OPT_IN_VALUE, 1) == 0);
++    CHECK(advc_vaapi_decode_eos_gate_enabled());
++    CHECK(unsetenv(ADVC_VAAPI_DECODE_EOS_OPT_IN_ENV) == 0);
++}
++
++static void test_progress_requires_signal(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_NOT_SIGNALED);
++    CHECK(mock.dequeue_calls == 0);
++    CHECK(status.phase == ADVC_VAAPI_DECODE_EOS_OPEN);
++}
++
++static void test_signal_retry_and_idempotence(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    mock.signal_results[0] = ADVC_VAAPI_DECODE_EOS_IO_RETRY;
++    mock.signal_results[1] = ADVC_VAAPI_DECODE_EOS_IO_OK;
++    mock.signal_result_count = 2;
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 11, 100, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_WOULD_BLOCK);
++    CHECK(state.phase == ADVC_VAAPI_DECODE_EOS_SIGNAL_PENDING);
++    CHECK((status.flags & ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_REQUESTED) != 0);
++    CHECK((status.flags & ADVC_VAAPI_DECODE_EOS_STATUS_SIGNAL_QUEUED) == 0);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(mock.frame_calls == 1);
++    CHECK((status.flags & ADVC_VAAPI_DECODE_EOS_STATUS_BUDGET_EXHAUSTED) != 0);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(state.phase == ADVC_VAAPI_DECODE_EOS_DRAINING);
++    CHECK(mock.signal_calls == 2);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(mock.signal_calls == 2);
++}
++
++static void test_control_eos_skips_frame_matching(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    /* A deliberately frame-looking PTS must not cause a surface lookup. */
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 21, 777,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.frame_calls == 0);
++    CHECK(mock.release_calls == 1);
++    CHECK(mock.released_ids[0] == 21);
++    CHECK(mock.outstanding_leases == 0);
++    CHECK(status.controls_released == 1);
++    CHECK((status.flags & ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_EOS_SEEN) != 0);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.dequeue_calls == 1);
++}
++
++static void test_frame_carrying_eos(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 31, 888,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) == 0);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.frame_calls == 1);
++    CHECK(mock.release_calls == 0);
++    CHECK(status.frames_processed == 1);
++}
++
++static void test_normal_drain_shares_terminal_state(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++
++    /* A normal surface query consumes control EOS through the shared state. */
++    init_mock(&mock);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 35, 999,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(mock_normal_drain_one(&state, &ops) == 0);
++    CHECK(state.phase == ADVC_VAAPI_DECODE_EOS_COMPLETE);
++    CHECK(state.controls_released_total == 1);
++    CHECK(mock.release_calls == 1);
++    CHECK(mock.dequeue_calls == 1);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.dequeue_calls == 1);
++
++    /* A normal surface query may likewise consume a frame carrying EOS. */
++    init_mock(&mock);
++    status = fresh_status();
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 36, 1000,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(mock_normal_drain_one(&state, &ops) == 1);
++    CHECK(state.phase == ADVC_VAAPI_DECODE_EOS_COMPLETE);
++    CHECK(state.frames_processed_total == 1);
++    CHECK(state.controls_released_total == 0);
++    CHECK(mock.frame_calls == 1);
++    CHECK(mock.dequeue_calls == 1);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.dequeue_calls == 1);
++}
++
++static void test_terminal_eos_fails_unmatched_pending_surfaces(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++
++    init_mock(&mock);
++    mock.terminal_session = 7;
++    mock.surface_sessions[0] = 7;
++    mock.surface_states[0] = MOCK_SURFACE_PENDING;
++    mock.surface_sessions[1] = 7;
++    mock.surface_states[1] = MOCK_SURFACE_READY;
++    mock.surface_sessions[2] = 8;
++    mock.surface_states[2] = MOCK_SURFACE_PENDING;
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 37, 1001,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.terminal_calls == 1);
++    CHECK(mock.surface_states[0] == MOCK_SURFACE_ERROR);
++    CHECK(mock.surface_states[1] == MOCK_SURFACE_READY);
++    CHECK(mock.surface_states[2] == MOCK_SURFACE_PENDING);
++
++    init_mock(&mock);
++    status = fresh_status();
++    mock.terminal_session = 7;
++    mock.frame_surface_index = 0;
++    mock.surface_sessions[0] = 7;
++    mock.surface_states[0] = MOCK_SURFACE_PENDING;
++    mock.surface_sessions[1] = 7;
++    mock.surface_states[1] = MOCK_SURFACE_PENDING;
++    mock.surface_sessions[2] = 7;
++    mock.surface_states[2] = MOCK_SURFACE_READY;
++    mock.surface_sessions[3] = 8;
++    mock.surface_states[3] = MOCK_SURFACE_PENDING;
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 38, 1002,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.terminal_calls == 1);
++    CHECK(mock.surface_states[0] == MOCK_SURFACE_READY);
++    CHECK(mock.surface_states[1] == MOCK_SURFACE_ERROR);
++    CHECK(mock.surface_states[2] == MOCK_SURFACE_READY);
++    CHECK(mock.surface_states[3] == MOCK_SURFACE_PENDING);
++}
++
++static void test_bad_output_cleanup(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 41, 0, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) == 0);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_FAILED);
++    CHECK(mock.frame_calls == 0);
++    CHECK(mock.release_calls == 1);
++    CHECK(mock.released_ids[0] == 41);
++
++    init_mock(&mock);
++    mock.fail_frame = 1;
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 42, 9, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) == 0);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 1, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_FAILED);
++    CHECK(mock.frame_calls == 1);
++    CHECK(mock.release_calls == 1);
++    CHECK(mock.released_ids[0] == 42);
++}
++
++static void test_bounded_budget(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 51, 1, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 52, 2, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 53, 3, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) == 0);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 2, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_OK);
++    CHECK(status.outputs_processed == 2);
++    CHECK(mock.dequeue_calls == 2);
++    CHECK(mock.item_index == 2);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 0, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT);
++    CHECK(advc_vaapi_decode_eos_state_progress(
++              &state, &ops, ADVC_VAAPI_DECODE_EOS_MAX_PROGRESS_OUTPUTS + 1,
++              &status) == ADVC_VAAPI_DECODE_EOS_RESULT_INVALID_ARGUMENT);
++    CHECK(mock.dequeue_calls == 2);
++}
++
++static void test_finite_output_window_never_spins(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    mock.window_size = 2;
++    mock.retain_frames = 1;
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 61, 1, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 62, 2, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 63, 3, 0,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FRAME);
++    add_item(&mock, ADVC_VAAPI_DECODE_EOS_IO_OK, 64, 3,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_FLAG_EOS,
++             ADVC_VAAPI_DECODE_EOS_OUTPUT_CONTROL);
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) == 0);
++
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 8, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE);
++    CHECK(status.outputs_processed == 2);
++    CHECK(mock.dequeue_calls == 3);
++    CHECK(mock.outstanding_leases == 2);
++
++    /* The caller can now push/release one surface before asking for progress. */
++    release_retained_frame(&mock);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 8, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE);
++    CHECK(status.outputs_processed == 1);
++    CHECK(mock.dequeue_calls == 5);
++    CHECK(mock.outstanding_leases == 2);
++
++    /* Release retained frames; the control EOS can then occupy and free a slot. */
++    release_retained_frame(&mock);
++    release_retained_frame(&mock);
++    status = fresh_status();
++    CHECK(advc_vaapi_decode_eos_state_progress(&state, &ops, 8, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_COMPLETE);
++    CHECK(mock.frame_calls == 3);
++    CHECK(mock.release_calls == 1);
++    CHECK(mock.released_ids[0] == 64);
++    CHECK(mock.outstanding_leases == 0);
++}
++
++static void test_signal_window_pressure_is_distinct(void) {
++    struct advc_vaapi_decode_eos_state state;
++    struct mock_broker mock;
++    struct advc_vaapi_decode_eos_ops ops;
++    struct advc_vaapi_decode_eos_status_v1 status = fresh_status();
++    init_mock(&mock);
++    mock.signal_results[0] = ADVC_VAAPI_DECODE_EOS_IO_OUTPUT_WINDOW_FULL;
++    mock.signal_result_count = 1;
++    ops = mock_ops(&mock);
++    advc_vaapi_decode_eos_state_init(&state);
++    CHECK(advc_vaapi_decode_eos_state_signal(&state, &ops, &status) ==
++          ADVC_VAAPI_DECODE_EOS_RESULT_NEED_OUTPUT_RELEASE);
++    CHECK((status.flags &
++           ADVC_VAAPI_DECODE_EOS_STATUS_OUTPUT_WINDOW_FULL) != 0);
++    CHECK(state.phase == ADVC_VAAPI_DECODE_EOS_SIGNAL_PENDING);
++}
++
++int main(void) {
++    CHECK(ADVC_VAAPI_DECODE_EOS_ABI_VERSION == 0x00010000u);
++    CHECK(ADVC_VAAPI_DECODE_EOS_MAX_PROGRESS_OUTPUTS == 8u);
++    test_exact_opt_in_gate();
++    test_progress_requires_signal();
++    test_signal_retry_and_idempotence();
++    test_control_eos_skips_frame_matching();
++    test_frame_carrying_eos();
++    test_normal_drain_shares_terminal_state();
++    test_terminal_eos_fails_unmatched_pending_surfaces();
++    test_bad_output_cleanup();
++    test_bounded_budget();
++    test_finite_output_window_never_spins();
++    test_signal_window_pressure_is_distinct();
++    puts("decode_eos_test: ok");
++    return 0;
++}

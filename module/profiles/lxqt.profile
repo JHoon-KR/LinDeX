@@ -1,0 +1,9 @@
+id=lxqt
+name=LXQt + labwc
+family=wlroots-0.18
+compositor=labwc
+install=apt
+composition=labwc wlr-randr xorg-xwayland foot vkmark vulkan-tools mesa-utils desktop-file-utils gvfs lxqt-config lxqt-globalkeys lxqt-notificationd lxqt-panel lxqt-qtplugin lxqt-runner lxqt-session lxqt-system-theme lxqt-themes pcmanfm-qt qterminal qtxdg-tools qt6-wayland layer-shell-qt adwaita-icon-theme
+debian_mappings=xorg-xwayland:xwayland
+appearance=debian-stock
+status=stable

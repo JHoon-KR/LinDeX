@@ -1,0 +1,107 @@
+#!/system/bin/sh
+# Install only the immutable stock compositor bridge revision used by v3.
+set -eu
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+    echo 'usage: install-bridge-runtime ROOTFS [PAYLOAD]' >&2
+    exit 2
+}
+ROOTFS=$1
+HERE=${0%/*}
+PAYLOAD=${2:-$HERE}
+RUNTIME_ID=stock-profile-bridge-v12
+SOURCE=$PAYLOAD/$RUNTIME_ID
+PARENT=$ROOTFS/opt/android-drm-lease-kit/bridge
+TARGET=$PARENT/$RUNTIME_ID
+STAGE=
+
+fail() { printf 'STOCK BRIDGE INSTALL REFUSE: %s\n' "$*" >&2; exit 78; }
+
+trusted_regular() {
+    [ -f "$1" ] && [ ! -L "$1" ] &&
+        [ "$(stat -c %u "$1" 2>/dev/null)" = 0 ] || return 1
+    case "$(stat -c %A "$1" 2>/dev/null)" in
+        ?????w????|????????w?) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+verify_runtime() {
+    runtime=$1
+    trusted_regular "$runtime/BRIDGE_RUNTIME.sha256" || return 1
+    for file in \
+        lib/libandroid-drm-bridge.so.1 \
+        lib/libandroid-drm-preload.so \
+        lib/libandroid-vulkan-drm-identity.so \
+        lib/libandroid-vulkan-drm-identity-layer.so \
+        lib/libandroid-usb-input-grab.so.1 \
+        lib/libdrm_lease_seat.so \
+        bin/android-drm-bridge-probe \
+        bin/drm_lease_client \
+        share/vulkan/explicit_layer.d/VK_LAYER_LINDEX_android_drm_identity.json; do
+        trusted_regular "$runtime/$file" || return 1
+    done
+    (cd "$runtime" && sha256sum -c BRIDGE_RUNTIME.sha256 >/dev/null 2>&1)
+}
+
+cleanup() {
+    cleanup_rc=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$STAGE" ]; then
+        case "$STAGE" in "$PARENT"/."$RUNTIME_ID".tmp.[0-9]*) rm -rf "$STAGE" ;; esac
+    fi
+    exit "$cleanup_rc"
+}
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+
+[ -d "$ROOTFS" ] && [ ! -L "$ROOTFS" ] || fail 'rootfs is missing or symlinked'
+trusted_regular "$PAYLOAD/BRIDGE_PAYLOAD.sha256" || fail 'payload manifest is untrusted'
+trusted_regular "$PAYLOAD/install-bridge-runtime" || fail 'payload installer is untrusted'
+(cd "$PAYLOAD" && sha256sum -c BRIDGE_PAYLOAD.sha256 >/dev/null 2>&1) ||
+    fail 'payload hash verification failed'
+
+component=$ROOTFS
+for name in opt android-drm-lease-kit bridge; do
+    component=$component/$name
+    [ ! -L "$component" ] || fail "target path is symlinked: $component"
+    if [ -e "$component" ]; then [ -d "$component" ] || fail "target is not a directory: $component"
+    else mkdir "$component"; fi
+    chmod 0755 "$component"
+done
+
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+    [ -d "$TARGET" ] && [ ! -L "$TARGET" ] || fail 'runtime target is unsafe'
+    if verify_runtime "$TARGET"; then
+        echo "STOCK BRIDGE READY: existing runtime=$TARGET"
+        exit 0
+    fi
+    fail 'existing immutable runtime failed verification'
+fi
+
+STAGE=$PARENT/."$RUNTIME_ID".tmp.$$
+mkdir -m 0700 "$STAGE"
+mkdir -m 0755 "$STAGE/bin" "$STAGE/lib"
+install -m 0644 "$SOURCE/BRIDGE_RUNTIME.sha256" "$STAGE/BRIDGE_RUNTIME.sha256"
+for file in \
+    lib/libandroid-drm-bridge.so.1 \
+    lib/libandroid-drm-preload.so \
+    lib/libandroid-vulkan-drm-identity.so \
+    lib/libandroid-vulkan-drm-identity-layer.so \
+    lib/libandroid-usb-input-grab.so.1 \
+    lib/libdrm_lease_seat.so; do
+    install -m 0644 "$SOURCE/$file" "$STAGE/$file"
+done
+mkdir -m 0755 "$STAGE/share" "$STAGE/share/vulkan" \
+    "$STAGE/share/vulkan/explicit_layer.d"
+install -m 0644 \
+    "$SOURCE/share/vulkan/explicit_layer.d/VK_LAYER_LINDEX_android_drm_identity.json" \
+    "$STAGE/share/vulkan/explicit_layer.d/VK_LAYER_LINDEX_android_drm_identity.json"
+for file in bin/android-drm-bridge-probe bin/drm_lease_client; do
+    install -m 0755 "$SOURCE/$file" "$STAGE/$file"
+done
+chown -R 0:0 "$STAGE"
+verify_runtime "$STAGE" || fail 'staged runtime failed verification'
+mv "$STAGE" "$TARGET"
+STAGE=
+echo "STOCK BRIDGE INSTALLED: runtime=$TARGET"

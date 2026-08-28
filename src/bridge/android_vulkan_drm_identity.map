@@ -1,0 +1,9 @@
+ANDROID_VULKAN_DRM_IDENTITY_1.0 {
+	global:
+		vkEnumerateDeviceExtensionProperties;
+		vkGetPhysicalDeviceProperties2;
+		vkGetPhysicalDeviceProperties2KHR;
+		vkGetInstanceProcAddr;
+	local:
+		*;
+};

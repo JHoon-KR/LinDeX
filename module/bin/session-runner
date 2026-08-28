@@ -1,0 +1,344 @@
+#!/system/bin/sh
+
+# Detach Android before the DRM launcher obtains SurfaceFlinger's master FD.
+# Samsung rejects DisplayManager Binder calls made after that privileged handoff,
+# even when the launcher later invokes `su 2000`.
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+
+# KernelSU WebUI commands inherit the manager app's cgroup v2 leaf. Android
+# freezes that leaf when the WebUI activity enters the background, which would
+# suspend Sway after its Wayland socket appears. Move only this long-lived
+# runner to the cgroup root before it creates any descendants. ADB and boot
+# service launches already start at the root and remain unchanged.
+detach_from_android_app_cgroup() {
+    unified_path=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | sed -n '1p')
+    case "$unified_path" in
+        /apps/uid_*/pid_*) ;;
+        *) return 0 ;;
+    esac
+    [ -w /sys/fs/cgroup/cgroup.procs ] || return 1
+    printf '%s\n' "$$" > /sys/fs/cgroup/cgroup.procs || return 1
+    [ "$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null | sed -n '1p')" = / ]
+}
+
+if ! detach_from_android_app_cgroup; then
+    echo 'SESSION RUNNER: REFUSE cannot detach from Android WebUI freezer cgroup'
+    exit 32
+fi
+
+STATE=/data/adb/debian-drm-lease-kit/state
+DISPLAY_CMD_LOG=/data/local/tmp/debian-display-command.log
+DISPLAY_ID=
+CHILD_PID=
+SESSION_TOKEN=
+RESTORING=0
+RESTORE_ANDROID_POLICY=${RESTORE_ANDROID_POLICY:-1}
+GROUP_FILE=$STATE/session.pgid
+START_INTENT_FILE=$STATE/session-start.intent
+
+write_session_start_intent() {
+    intent_started=$(date +%s)
+    case "$intent_started" in ''|*[!0-9]*) return 1 ;; esac
+    write_state_value "$START_INTENT_FILE" "$$ $intent_started"
+}
+
+clear_owned_start_intent() {
+    clear_session_start_intent "$$" 2>/dev/null || true
+}
+
+valid_session_group() {
+    case "$CHILD_PID" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$CHILD_PID" -gt 1 ] || return 1
+    if [ -r "/proc/$CHILD_PID/stat" ]; then
+        group_id=$(awk '{print $5}' "/proc/$CHILD_PID/stat" 2>/dev/null)
+        group_cmd=$(read_proc_cmdline "$CHILD_PID") || group_cmd=
+        case "$group_id:$group_cmd" in
+            "$CHILD_PID:"*'/bin/launch-stock-profile'*) return 0 ;;
+        esac
+    fi
+    [ -n "$SESSION_TOKEN" ] &&
+        owned_process_group_running "$CHILD_PID" "$SESSION_TOKEN" && return 0
+    return 1
+}
+
+stop_session_group() {
+    valid_session_group || { rm -f "$GROUP_FILE"; return 0; }
+    owned_group=$CHILD_PID
+    owned_token=$SESSION_TOKEN
+    kill -TERM -- "-$owned_group" 2>/dev/null || kill -TERM "$owned_group" 2>/dev/null || true
+    group_attempt=0
+    group_attempt_limit=${SESSION_GROUP_TERM_TIMEOUT:-8}
+    while owned_process_group_running "$owned_group" "$owned_token" &&
+          [ "$group_attempt" -lt "$group_attempt_limit" ]; do
+        sleep 1
+        group_attempt=$((group_attempt + 1))
+    done
+    if owned_process_group_running "$owned_group" "$owned_token"; then
+        kill -KILL -- "-$owned_group" 2>/dev/null || kill -KILL "$owned_group" 2>/dev/null || true
+    fi
+    wait "$owned_group" 2>/dev/null || true
+    rm -f "$GROUP_FILE"
+}
+
+external_display_id() {
+    ids=$(cmd display get-displays --ids-only --type external 2>/dev/null)
+    set -- $ids
+    [ "$#" -eq 1 ] || return 1
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$1"
+}
+
+captured_external_display_line() {
+    restore_display_id=$1
+    case "$restore_display_id" in ''|*[!0-9]*) return 1 ;; esac
+
+    # Stream DisplayManager output instead of storing the complete dump in a
+    # shell variable.  Samsung dumps can exceed ARG_MAX; expanding such a
+    # variable into grep/printf previously made display restoration fail with
+    # "Argument list too long" after a compositor session stopped.
+    restore_display_line=$(/system/bin/cmd display get-displays \
+        --type external 2>/dev/null | awk -v id="$restore_display_id" '
+            index($0, "Display id " id ":") == 1 { print; exit }
+        ') || restore_display_line=
+    case "$restore_display_line" in
+        *" type EXTERNAL"*|*" type=EXTERNAL"*)
+            printf '%s\n' "$restore_display_line"
+            return 0
+            ;;
+    esac
+
+    # DisplayManager.getDisplays() may omit a connected logical display while
+    # it is disabled. Its exact DisplayInfo remains in the display-service dump.
+    restore_display_line=$(/system/bin/dumpsys display 2>/dev/null |
+        awk -v id="$restore_display_id" '
+            /DisplayInfo\{/ &&
+            ($0 ~ ("displayId[ =]" id "([, }]|$)")) &&
+            ($0 ~ /type[ =]EXTERNAL([, }]|$)/) { print; exit }
+        ') || return 1
+    [ -n "$restore_display_line" ] || return 1
+    printf '%s\n' "$restore_display_line"
+}
+
+captured_external_display_connected() {
+    captured_external_display_line "$1" >/dev/null
+}
+
+captured_external_display_state() {
+    restore_display_id=$1
+    restore_display_line=$(captured_external_display_line \
+        "$restore_display_id") || return 2
+
+    case "$restore_display_line" in
+        *" state ON,"*|*" state=ON,"*|*" state ON}"*|*" state=ON}"*)
+            printf 'ON\n'
+            ;;
+        *" state OFF,"*|*" state=OFF,"*|*" state OFF}"*|*" state=OFF}"*)
+            printf 'OFF\n'
+            ;;
+        *)
+            printf 'UNKNOWN\n'
+            return 3
+            ;;
+    esac
+}
+
+wait_for_captured_display_state() {
+    restore_display_id=$1
+    restore_expected_state=$2
+    restore_attempt_limit=$3
+    restore_attempt=0
+    restore_observed_state=UNKNOWN
+
+    while [ "$restore_attempt" -lt "$restore_attempt_limit" ]; do
+        if restore_observed_state=$(captured_external_display_state \
+            "$restore_display_id"); then
+            if [ "$restore_observed_state" = "$restore_expected_state" ]; then
+                printf '%s\n' "$restore_observed_state"
+                return 0
+            fi
+        else
+            restore_state_rc=$?
+            case "$restore_state_rc" in
+                2) restore_observed_state=DISCONNECTED ;;
+                *) restore_observed_state=UNKNOWN ;;
+            esac
+        fi
+        restore_attempt=$((restore_attempt + 1))
+        [ "$restore_attempt" -ge "$restore_attempt_limit" ] || sleep 1
+    done
+
+    printf '%s\n' "$restore_observed_state"
+    return 1
+}
+
+run_captured_display_action() {
+    restore_action=$1
+    restore_display_id=$2
+    case "$restore_action" in
+        enable-display|disable-display|power-reset) ;;
+        *) return 64 ;;
+    esac
+    case "$restore_display_id" in ''|*[!0-9]*) return 64 ;; esac
+
+    /system/bin/su 2000 -c \
+        "/system/bin/cmd display $restore_action $restore_display_id >>$DISPLAY_CMD_LOG 2>&1 </dev/null"
+}
+
+restore_android_display() {
+    clear_owned_start_intent
+    [ "$RESTORE_ANDROID_POLICY" = 1 ] || return 0
+    [ "$RESTORING" = 0 ] || return 0
+    RESTORING=1
+    if [ -n "$DISPLAY_ID" ]; then
+        echo "SESSION RUNNER: restoring Android external Display ID=$DISPLAY_ID"
+        if ! physical_dp_path >/dev/null 2>&1; then
+            echo "SESSION RUNNER: physical DP/EDID absent; exact-ID restore skipped Display ID=$DISPLAY_ID"
+            return 0
+        fi
+        rm -f "$DISPLAY_CMD_LOG"
+        restore_enable_ok=0
+        if run_captured_display_action enable-display "$DISPLAY_ID"; then
+            restore_enable_ok=1
+        else
+            cat "$DISPLAY_CMD_LOG" 2>/dev/null || true
+            echo "SESSION RUNNER: WARNING initial restore command failed Display ID=$DISPLAY_ID"
+        fi
+
+        if restore_state=$(wait_for_captured_display_state "$DISPLAY_ID" ON 3); then
+            restore_state_rc=0
+        else
+            restore_state_rc=$?
+        fi
+        if [ "$restore_state_rc" -eq 0 ]; then
+            # Samsung DisplayManager can report ON for several seconds before
+            # a queued HWC detach finally drives it back to OFF. Verify the
+            # exact captured display at bounded elapsed checkpoints 2/5/8/12s.
+            # A real unplug aborts without sending any further display action.
+            restore_stable=1
+            for restore_delay in 2 3 3 4; do
+                sleep "$restore_delay"
+                if ! physical_dp_path >/dev/null 2>&1; then
+                    restore_state=DISCONNECTED
+                    restore_stable=0
+                    break
+                fi
+                if ! restore_state=$(wait_for_captured_display_state \
+                    "$DISPLAY_ID" ON 1); then
+                    restore_stable=0
+                    break
+                fi
+            done
+            if [ "$restore_stable" -eq 1 ]; then
+                echo "SESSION RUNNER: Android external Display ID=$DISPLAY_ID restored state=ON stable=12s"
+                return 0
+            fi
+            echo "SESSION RUNNER: Display ID=$DISPLAY_ID restore was transient; observed state=$restore_state"
+        fi
+
+        if [ "$restore_state" != OFF ]; then
+            [ "$restore_enable_ok" -eq 1 ] || cat "$DISPLAY_CMD_LOG" 2>/dev/null || true
+            echo "SESSION RUNNER: WARNING restore state=$restore_state Display ID=$DISPLAY_ID; targeted recovery skipped"
+            return 0
+        fi
+
+        echo "SESSION RUNNER: Display ID=$DISPLAY_ID remains OFF; running exact-ID recovery"
+        if ! physical_dp_path >/dev/null 2>&1; then
+            echo "SESSION RUNNER: recovery stopped; physical DP/EDID absent Display ID=$DISPLAY_ID"
+            return 0
+        fi
+        if ! run_captured_display_action disable-display "$DISPLAY_ID"; then
+            echo "SESSION RUNNER: WARNING recovery disable failed Display ID=$DISPLAY_ID"
+        fi
+        sleep 1
+        if ! physical_dp_path >/dev/null 2>&1 ||
+           ! captured_external_display_connected "$DISPLAY_ID"; then
+            echo "SESSION RUNNER: WARNING recovery stopped; Display ID=$DISPLAY_ID disconnected"
+            return 0
+        fi
+
+        if ! run_captured_display_action enable-display "$DISPLAY_ID"; then
+            echo "SESSION RUNNER: WARNING recovery enable failed Display ID=$DISPLAY_ID"
+        fi
+        sleep 1
+        if ! physical_dp_path >/dev/null 2>&1 ||
+           ! captured_external_display_connected "$DISPLAY_ID"; then
+            echo "SESSION RUNNER: WARNING recovery stopped; Display ID=$DISPLAY_ID disconnected"
+            return 0
+        fi
+
+        if ! run_captured_display_action power-reset "$DISPLAY_ID"; then
+            echo "SESSION RUNNER: WARNING recovery power-reset failed Display ID=$DISPLAY_ID"
+        fi
+        if restore_state=$(wait_for_captured_display_state "$DISPLAY_ID" ON 4); then
+            restore_state_rc=0
+        else
+            restore_state_rc=$?
+        fi
+        if [ "$restore_state_rc" -eq 0 ]; then
+            echo "SESSION RUNNER: Android external Display ID=$DISPLAY_ID recovered state=ON"
+        else
+            cat "$DISPLAY_CMD_LOG" 2>/dev/null || true
+            echo "SESSION RUNNER: WARNING recovery verification state=$restore_state Display ID=$DISPLAY_ID"
+        fi
+    fi
+}
+
+terminate_session() {
+    trap - HUP INT TERM
+    stop_session_group
+    restore_android_display
+    exit 143
+}
+
+finish_session_runner() {
+    # KernelSU soft-restart and unexpected shell exits can wake wait(1) while
+    # the detached native compositor process group is still alive.  Always
+    # reconcile the owned group before discarding the runner state; on the
+    # ordinary path CHILD_PID has already been cleared, so this is a no-op.
+    stop_session_group
+    restore_android_display
+    [ "$BUILD_FLAVOR" = dev ] || rm -f "$DISPLAY_CMD_LOG"
+}
+
+trap finish_session_runner EXIT
+trap terminate_session HUP INT TERM
+
+if DISPLAY_ID=$(external_display_id); then
+    echo "$DISPLAY_ID" > "$STATE/last_dp_display_id"
+    echo "SESSION RUNNER: pre-detaching Android external Display ID=$DISPLAY_ID"
+    if ! write_session_start_intent; then
+        echo "SESSION RUNNER: REFUSE could not record bounded pre-detach intent"
+        exit 31
+    fi
+    # Binder's shellCommand transaction passes stdin/stdout/stderr to
+    # system_server.  Do not let those descriptors inherit the root-only
+    # /data/adb session log: Samsung rejects that transaction.  A shell-owned
+    # /data/local/tmp descriptor works in both WebUI and auto-start contexts.
+    rm -f "$DISPLAY_CMD_LOG"
+    if ! /system/bin/su 2000 -c "/system/bin/cmd display disable-display $DISPLAY_ID >$DISPLAY_CMD_LOG 2>&1 </dev/null"; then
+        cat "$DISPLAY_CMD_LOG" 2>/dev/null || true
+        echo "SESSION RUNNER: REFUSE pre-detach failed Display ID=$DISPLAY_ID"
+        exit 31
+    fi
+    # HWC needs several quiet frames before the launcher samples KMS ownership.
+    sleep 5
+else
+    echo "SESSION RUNNER: no unique Android external Display ID; launcher safety checks remain authoritative"
+    DISPLAY_ID=
+fi
+
+SESSION_TOKEN=lindex-$$-$(date +%s)
+SESSION_START_OWNER_PID=$$ LINDEX_SESSION_TOKEN=$SESSION_TOKEN \
+    /system/bin/setsid "$@" &
+CHILD_PID=$!
+printf '%s %s\n' "$CHILD_PID" "$SESSION_TOKEN" > "$GROUP_FILE"
+chmod 0600 "$GROUP_FILE"
+wait "$CHILD_PID"
+RC=$?
+stop_session_group
+CHILD_PID=
+restore_android_display
+exit "$RC"

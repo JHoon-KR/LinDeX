@@ -1,0 +1,163 @@
+#!/system/bin/sh
+# Transfer one physical DP lease to an unmodified compositor profile.
+set -eu
+
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+. "$MODDIR/bin/common.sh"
+resolve_moddir
+load_config
+
+[ "${1:-}" = --profile ] && [ "$#" -eq 2 ] || {
+    echo 'usage: launch-stock-profile --profile PROFILE' >&2
+    exit 2
+}
+PROFILE=$2
+profile_valid "$PROFILE" || { echo 'invalid profile' >&2; exit 2; }
+
+RUNTIME_ID=stock-profile-bridge-v12
+BRIDGE_ROOT=/opt/android-drm-lease-kit/bridge/$RUNTIME_ID
+RUN_ID=$$
+BROKER_SOCKET_HOST=$ROOTFS/run/android-drm/profile-$RUN_ID.sock
+BROKER_SOCKET_GUEST=/run/android-drm/profile-$RUN_ID.sock
+SESSION_SOURCE=$MODDIR/bin/stock-profile-session
+SESSION_GUEST=/run/android-drm/stock-profile-session-$RUN_ID
+SESSION_HOST=$ROOTFS$SESSION_GUEST
+BROKER_PID=
+SESSION_PID=
+MODE_PID=
+
+fail() {
+    printf 'STOCK PROFILE REFUSE: %s\n' "$*" >&2
+    exit 78
+}
+
+valid_pid() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ]
+}
+
+stop_pid() {
+    target=$1
+    if valid_pid "$target" && kill -0 "$target" 2>/dev/null; then
+        kill -TERM "$target" 2>/dev/null || true
+        wait "$target" 2>/dev/null || true
+    fi
+}
+
+[ "$(id -u)" -eq 0 ] || fail 'root is required'
+[ -d "$ROOTFS" ] && [ ! -L "$ROOTFS" ] || fail 'Debian rootfs is missing or symlinked'
+[ -x "$MODDIR/bin/drm_lease_broker" ] || fail 'lease broker is missing'
+[ -f "$SESSION_SOURCE" ] && [ ! -L "$SESSION_SOURCE" ] || fail 'inner session is missing or symlinked'
+[ -x "$ROOTFS$BRIDGE_ROOT/bin/drm_lease_client" ] || fail 'v12 bridge client is missing'
+[ -r "$ROOTFS$BRIDGE_ROOT/BRIDGE_RUNTIME.sha256" ] || fail 'v12 bridge manifest is missing'
+(cd "$ROOTFS$BRIDGE_ROOT" && sha256sum -c BRIDGE_RUNTIME.sha256 >/dev/null 2>&1) ||
+    fail 'v12 bridge verification failed'
+
+ensure_chroot_mounts
+mkdir -p "$ROOTFS/run/udev/rules.d"
+
+# A desktop session must never inherit a half-configured hardware-codec path.
+# Keep it disabled unless the identity-checked broker is ready in the current
+# /run mount and the packaged VA driver passes its own digest manifest.
+SESSION_VIDEO_ACCELERATION=disabled
+if [ "$VIDEO_ACCELERATION" = auto ]; then
+    if prepare_advc_codec_runtime; then
+        SESSION_VIDEO_ACCELERATION=auto
+    else
+        echo 'VIDEO ACCELERATION: unavailable; ADVC VA-API advertisement disabled' >&2
+    fi
+fi
+
+INPUT_RULE=$ROOTFS/run/udev/rules.d/90-android-drm-internal-touch.rules
+if [ "$SHARE_TOUCH" = 0 ]; then
+    {
+        echo 'ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="sec_touchscreen", ENV{LIBINPUT_IGNORE_DEVICE}="1"'
+        echo 'ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="sec_touchpad", ENV{LIBINPUT_IGNORE_DEVICE}="1"'
+    } > "$INPUT_RULE"
+    chmod 0644 "$INPUT_RULE"
+else
+    rm -f "$INPUT_RULE"
+fi
+
+cleanup() {
+    cleanup_rc=$?
+    trap - EXIT HUP INT TERM
+    stop_pid "$MODE_PID"
+    stop_pid "$SESSION_PID"
+    stop_pid "$BROKER_PID"
+    rm -f "$BROKER_SOCKET_HOST" "$SESSION_HOST" "$INPUT_RULE"
+    exit "$cleanup_rc"
+}
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+
+rm -f "$BROKER_SOCKET_HOST" "$SESSION_HOST"
+cp -f "$SESSION_SOURCE" "$SESSION_HOST"
+chown 0:0 "$SESSION_HOST"
+chmod 0700 "$SESSION_HOST"
+[ "$(sha256sum "$SESSION_SOURCE" | awk '{print $1}')" = \
+  "$(sha256sum "$SESSION_HOST" | awk '{print $1}')" ] || fail 'inner session copy differs'
+
+if ! /system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    /usr/bin/udevadm control --ping >/dev/null 2>&1; then
+    /system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+        /lib/systemd/systemd-udevd --daemon
+    sleep 1
+fi
+/system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    /usr/bin/udevadm control --reload >/dev/null 2>&1 || true
+/system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    /usr/bin/udevadm trigger --subsystem-match=input --action=change >/dev/null 2>&1 || true
+/system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    /usr/bin/udevadm trigger --subsystem-match=drm --action=change >/dev/null 2>&1 || true
+/system/bin/chroot "$ROOTFS" /usr/bin/env SYSTEMD_IN_CHROOT=0 SYSTEMD_IGNORE_CHROOT=1 \
+    /usr/bin/udevadm settle --timeout=5 >/dev/null 2>&1 || true
+
+"$MODDIR/bin/drm_lease_broker" --auto --socket "$BROKER_SOCKET_HOST" &
+BROKER_PID=$!
+ready=0
+attempt=0
+while [ "$attempt" -lt 80 ]; do
+    if [ -S "$BROKER_SOCKET_HOST" ]; then ready=1; break; fi
+    kill -0 "$BROKER_PID" 2>/dev/null || break
+    sleep 0.1
+    attempt=$((attempt + 1))
+done
+[ "$ready" -eq 1 ] || fail 'lease broker did not become ready'
+
+/system/bin/chroot "$ROOTFS" /usr/bin/env \
+    -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+    PATH="$BRIDGE_ROOT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME=/root LANG=C.UTF-8 XDG_RUNTIME_DIR=/run/user/0 \
+    ANDROID_DRM_PROFILE="$PROFILE" \
+    ANDROID_DRM_XWAYLAND="$ALLOW_XWAYLAND" \
+    ANDROID_DRM_USB_INPUT_MODE="$USB_INPUT_MODE" \
+    ANDROID_DRM_VIDEO_ACCELERATION="$SESSION_VIDEO_ACCELERATION" \
+    ANDROID_DRM_OUTPUT_MODIFIER_POLICY="$OUTPUT_MODIFIER_POLICY" \
+    ANDROID_DRM_DIRECT_SCANOUT="$DIRECT_SCANOUT" \
+    /usr/bin/dbus-run-session -- \
+    "$BRIDGE_ROOT/bin/drm_lease_client" --socket "$BROKER_SOCKET_GUEST" \
+    "$SESSION_GUEST" --profile "$PROFILE" &
+SESSION_PID=$!
+sleep 1
+if kill -0 "$SESSION_PID" 2>/dev/null; then
+    # The broker and lease client now own the startup path; the temporary
+    # DisplayManager pre-detach exemption is no longer needed.
+    clear_session_start_intent "${SESSION_START_OWNER_PID:-}" 2>/dev/null || true
+fi
+
+experimental=0
+if [ "${DISPLAY_MODE:-auto}" != auto ] &&
+   "$MODDIR/bin/debian-gpu-control" display-modes 2>/dev/null |
+       grep -Fxq "EXPERIMENTAL_MODE=${DISPLAY_MODE}"; then
+    experimental=1
+fi
+"$MODDIR/bin/apply-output-mode" "${DISPLAY_MODE:-auto}" "$ROOTFS" "$experimental" &
+MODE_PID=$!
+
+if wait "$SESSION_PID"; then session_rc=0; else session_rc=$?; fi
+SESSION_PID=
+stop_pid "$MODE_PID"
+MODE_PID=
+exit "$session_rc"
