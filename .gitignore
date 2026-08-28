@@ -63,6 +63,11 @@ Thumbs.db
 !/tests/bridge/vulkan_drm_identity_test.c
 !/tests/bridge/vulkan_drm_identity_layer_ack_test.c
 !/tests/bridge/vulkan_drm_identity_layer_lifecycle_test.c
+!/tests/fixtures/
+/tests/fixtures/*
+!/tests/fixtures/gstreamer-h264-diagnostic/
+/tests/fixtures/gstreamer-h264-diagnostic/*
+!/tests/fixtures/gstreamer-h264-diagnostic/gst-launch-fixture.sh
 
 # Old v2/device-specific scripts. Current v3 scripts remain visible.
 /scripts/*kwin*
